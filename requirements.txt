@@ -1,2 +1,4 @@
 aiogram==2.25.1
 requests
+google-auth
+google-api-python-client
