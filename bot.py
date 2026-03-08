@@ -1,3 +1,5 @@
+import os
+import json
 import csv
 import io
 import logging
@@ -20,19 +22,22 @@ from googleapiclient.discovery import build
 
 
 # =========================
-# НАСТРОЙКИ (8559074588:AAG8xcsaS0f5s-GNvLCP64Ejcg5vhOj6dpI)
+# НАСТРОЙКИ
 # =========================
 
-BOT_TOKEN = "8559074588:AAG8xcsaS0f5s-GNvLCP64Ejcg5vhOj6dpI"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 # Таблица ТОВАРОВ (публичная, CSV):
 PRODUCTS_CSV_URL = "https://docs.google.com/spreadsheets/d/1V1LCKR13JNply4LAEfJBtYNAE854Zr8aBBMTUTC2kPA/gviz/tq?tqx=out:csv"
 
 # Таблица ПОКУПОК (приватная):
-PURCHASES_SHEET_ID = "1SHhqCUS4c_-vPkaY5R38975RjlRLU0y-RvICQ7zrze0"
+PURCHASES_SHEET_ID = os.getenv("PURCHASES_SHEET_ID", "1SHhqCUS4c_-vPkaY5R38975RjlRLU0y-RvICQ7zrze0").strip()
 
-# Путь к JSON ключу service account
-SERVICE_ACCOUNT_JSON_PATH = "artkids-bot-dd8894a2e080.json"
+# JSON сервисного аккаунта целиком, одной строкой, из Railway Variables
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN")
 
 # Админ и поддержка
 ADMIN_CHAT_ID = 8491241832
@@ -101,8 +106,12 @@ def get_sheets_service():
     if _sheets_service is not None:
         return _sheets_service
 
-    creds = Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_JSON_PATH,
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise RuntimeError("Не задан GOOGLE_SERVICE_ACCOUNT_JSON")
+
+    creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    creds = Credentials.from_service_account_info(
+        creds_info,
         scopes=_SCOPES
     )
     _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
