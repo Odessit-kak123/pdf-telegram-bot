@@ -720,12 +720,21 @@ def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeybo
 def format_product_card(product: Dict[str, Any]) -> str:
     title = product.get("title", "PDF")
     desc = _to_str(product.get("description"), "PDF файл")
-    price_line = "🎁 Бесплатно" if is_free_product(product) else f"⭐ Цена: {int(product.get('price_xtr', 0))} Stars"
+
+    price_xtr = int(product.get("price_xtr", 0) or 0)
+    price_crypto_raw = _to_str(product.get("price_crypto", ""))
+    crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
+
+    if is_free_product(product):
+        price_line = "🎁 Бесплатно"
+    elif price_xtr > 0:
+        price_line = f"⭐ Цена: {price_xtr} Stars"
+    else:
+        price_line = "💰 Оплата криптой"
 
     crypto_line = ""
-    if can_buy_with_crypto(product):
-        amount, asset = get_crypto_amount_and_asset(product)
-        crypto_line = f"\n₿ Криптой: {amount} {asset}"
+    if price_crypto_raw and crypto_asset:
+        crypto_line = f"\n₿ Криптой: {price_crypto_raw} {crypto_asset}"
 
     return f"📄 <b>{title}</b>\n\n{desc}\n\n{price_line}{crypto_line}"
 
