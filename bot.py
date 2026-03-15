@@ -673,28 +673,47 @@ async def cb_category(call: types.CallbackQuery):
 
 def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
+
     pid = product["product_id"]
 
-    if is_free_product(product):
-        kb.add(InlineKeyboardButton("🎁 Скачать бесплатно", callback_data=f"get:{pid}"))
-    else:
+    price_xtr = int(product.get("price_xtr", 0) or 0)
+    price_crypto = float(product.get("price_crypto", 0) or 0)
+    crypto_asset = str(product.get("crypto_asset", "")).strip()
+
+    # Stars кнопка
+    if price_xtr > 0:
         kb.add(
             InlineKeyboardButton(
-                f"⭐ Купить за {product['price_xtr']} Stars",
-                callback_data=f"paystars:{pid}"
+                f"⭐ Купить за {price_xtr} Stars",
+                callback_data=f"pay:{pid}"
             )
         )
 
-        if can_buy_with_crypto(product):
-            amount, asset = get_crypto_amount_and_asset(product)
-            kb.add(
-                InlineKeyboardButton(
-                    f"₿ Оплатить криптой ({amount} {asset})",
-                    callback_data=f"paycrypto:{pid}"
-                )
+    # Crypto кнопка
+    if price_crypto > 0 and crypto_asset:
+        kb.add(
+            InlineKeyboardButton(
+                f"💰 Купить за {price_crypto} {crypto_asset}",
+                callback_data=f"crypto:{pid}"
             )
+        )
 
-    kb.add(InlineKeyboardButton("⬅️ Назад к списку", callback_data=f"back_items:{category_key}"))
+    # Бесплатно
+    if price_xtr == 0 and price_crypto == 0:
+        kb.add(
+            InlineKeyboardButton(
+                "🎁 Скачать бесплатно",
+                callback_data=f"get:{pid}"
+            )
+        )
+
+    kb.add(
+        InlineKeyboardButton(
+            "⬅️ Назад к списку",
+            callback_data=f"back_items:{category_key}"
+        )
+    )
+
     return kb
 
 
