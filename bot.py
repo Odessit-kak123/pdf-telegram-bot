@@ -677,29 +677,29 @@ def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeybo
     pid = product["product_id"]
 
     price_xtr = int(product.get("price_xtr", 0) or 0)
-    price_crypto = float(product.get("price_crypto", 0) or 0)
-    crypto_asset = str(product.get("crypto_asset", "")).strip()
+    price_crypto_raw = str(product.get("price_crypto", "")).strip()
+    crypto_asset = str(product.get("crypto_asset", "")).strip().upper()
 
     # Stars кнопка
     if price_xtr > 0:
         kb.add(
             InlineKeyboardButton(
                 f"⭐ Купить за {price_xtr} Stars",
-                callback_data=f"pay:{pid}"
+                callback_data=f"paystars:{pid}"
             )
         )
 
     # Crypto кнопка
-    if price_crypto > 0 and crypto_asset:
+    if price_crypto_raw and crypto_asset:
         kb.add(
             InlineKeyboardButton(
-                f"💰 Купить за {price_crypto} {crypto_asset}",
-                callback_data=f"crypto:{pid}"
+                f"💰 Купить за {price_crypto_raw} {crypto_asset}",
+                callback_data=f"paycrypto:{pid}"
             )
         )
 
     # Бесплатно
-    if price_xtr == 0 and price_crypto == 0:
+    if price_xtr == 0 and not price_crypto_raw:
         kb.add(
             InlineKeyboardButton(
                 "🎁 Скачать бесплатно",
