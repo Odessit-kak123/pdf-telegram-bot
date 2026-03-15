@@ -242,9 +242,12 @@ def load_products() -> List[Dict[str, Any]]:
 
 
 def is_free_product(p: Dict[str, Any]) -> bool:
-    cat = _to_str(p.get("category", ""))
-    return (_to_int(p.get("price_xtr", 0), 0) == 0) or (cat == FREE_CATEGORY_NAME)
+    cat = str(p.get("category", "")).strip()
 
+    price_xtr = int(p.get("price_xtr", 0) or 0)
+    price_crypto = float(p.get("price_crypto", 0) or 0)
+
+    return (price_xtr == 0 and price_crypto == 0) or (cat == FREE_CATEGORY_NAME)
 
 def can_buy_with_crypto(product: Dict[str, Any]) -> bool:
     if is_free_product(product):
