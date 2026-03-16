@@ -972,8 +972,12 @@ async def cb_back_items(call: types.CallbackQuery):
     try:
         msg = call.message
         if msg.photo:
-            # FIX #6: добавлен parse_mode
-            await msg.edit_caption(caption=text, reply_markup=kb, parse_mode="HTML")
+            # Фото нельзя заменить текстом — удаляем карточку и отправляем список заново
+            try:
+                await msg.delete()
+            except Exception:
+                pass  # Если удалить не получилось — не страшно, просто отправим ниже
+            await bot.send_message(call.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
         else:
             await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
