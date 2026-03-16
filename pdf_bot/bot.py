@@ -26,7 +26,7 @@ try:
     _GOOGLE_LIBS_AVAILABLE = True
 except ImportError:
     _GOOGLE_LIBS_AVAILABLE = False
-    logger.warning("google-auth / googleapiclient не установлены — зеркало в Sheets отключено")
+    # logger ещё не создан на этом этапе — предупреждение выведем позже
 
 
 # =========================
@@ -79,6 +79,9 @@ if not BOT_TOKEN:
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("artkids_bot")
+
+if not _GOOGLE_LIBS_AVAILABLE:
+    logger.warning("google-auth / googleapiclient не установлены — зеркало в Sheets отключено")
 
 logger.info("CRYPTO PAY TOKEN LOADED: %s", bool(CRYPTO_PAY_TOKEN))
 logger.info("CRYPTO PAY BASE URL: %s", CRYPTO_PAY_BASE_URL)
