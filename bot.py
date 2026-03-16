@@ -759,11 +759,13 @@ async def show_categories(message: types.Message):
         return
 
     categories = sorted(set(_to_str(p.get("category", "")) for p in products if p.get("category")))
-    await message.answer(
+    sent = await message.answer(
         "📚 <b>Каталог</b>\n\nВыберите категорию:",
         reply_markup=categories_keyboard(categories),
         parse_mode="HTML"
     )
+    # Сбрасываем старый список — пришли из текстовой кнопки
+    _last_product_list_msg.pop(message.chat.id, None)
 
 
 # =========================
@@ -881,16 +883,23 @@ async def cb_category(call: types.CallbackQuery):
 
     text = f"📂 <b>{category}</b>\n\nВыберите материал:"
     kb = products_keyboard(products, category_key=key)
+    chat_id = call.message.chat.id
+
+    # Удаляем предыдущий список товаров если он есть
+    old_id = _last_product_list_msg.get(chat_id)
+    if old_id and old_id != call.message.message_id:
+        try:
+            await bot.delete_message(chat_id, old_id)
+        except Exception:
+            pass
+
     try:
+        # Пробуем отредактировать текущее сообщение (каталог)
         sent = await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-        # edit_text возвращает Message — запоминаем id
-        if sent:
-            _last_product_list_msg[call.message.chat.id] = sent.message_id
-        else:
-            _last_product_list_msg[call.message.chat.id] = call.message.message_id
+        _last_product_list_msg[chat_id] = sent.message_id if sent else call.message.message_id
     except Exception:
         sent = await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
-        _last_product_list_msg[call.message.chat.id] = sent.message_id
+        _last_product_list_msg[chat_id] = sent.message_id
     await call.answer()
 
 
