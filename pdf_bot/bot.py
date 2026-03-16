@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import csv
 import io
@@ -6,6 +7,7 @@ import asyncio
 import logging
 import time
 import hashlib
+import sqlite3
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -18,8 +20,13 @@ from aiogram.types import (
 )
 from aiogram.utils import executor
 
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
+try:
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    _GOOGLE_LIBS_AVAILABLE = True
+except ImportError:
+    _GOOGLE_LIBS_AVAILABLE = False
+    logger.warning("google-auth / googleapiclient не установлены — зеркало в Sheets отключено")
 
 
 # =========================
@@ -31,13 +38,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 # Таблица ТОВАРОВ (публичная, CSV):
 PRODUCTS_CSV_URL = "https://docs.google.com/spreadsheets/d/1V1LCKR13JNply4LAEfJBtYNAE854Zr8aBBMTUTC2kPA/gviz/tq?tqx=out:csv"
 
-# Таблица ПОКУПОК (приватная):
-PURCHASES_SHEET_ID = os.getenv(
-    "PURCHASES_SHEET_ID",
-    "1SHhqCUS4c_-vPkaY5R38975RjlRLU0y-RvICQ7zrze0"
-).strip()
+# SQLite база покупок (хранится на Railway Volume или рядом с bot.py)
+DB_PATH = os.getenv("DB_PATH", "purchases.db").strip()
 
-# JSON сервисного аккаунта целиком, одной строкой, из Railway Variables
+# Google Sheets — только для резервного зеркалирования покупок (необязательно)
+# Если GOOGLE_SERVICE_ACCOUNT_JSON не задан, зеркалирование просто отключается.
+PURCHASES_SHEET_ID = os.getenv("PURCHASES_SHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
 # Админ и поддержка
@@ -91,16 +97,38 @@ _purchase_locks: Dict[str, asyncio.Lock] = {}
 _purchase_locks_meta: Dict[str, float] = {}
 _LOCK_TTL = 300  # 5 минут, потом чистим
 
+# Шаг 3: защита от дублирующих crypto-invoice
+# Хранит: (user_id, product_id) -> timestamp последнего создания invoice
+_crypto_invoice_created_at: Dict[str, float] = {}
+_CRYPTO_INVOICE_COOLDOWN = 60   # секунд между созданиями invoice для одного товара
+_CRYPTO_INVOICE_MAX_AGE = 3600  # старше 1 часа — чистим из словаря
+
+
+def _cleanup_invoice_cooldown() -> None:
+    """Удаляет устаревшие записи cooldown. Вызывать изредка."""
+    cutoff = time.time() - _CRYPTO_INVOICE_MAX_AGE
+    expired = [k for k, ts in _crypto_invoice_created_at.items() if ts < cutoff]
+    for k in expired:
+        del _crypto_invoice_created_at[k]
+    if expired:
+        logger.debug("Cleaned %d expired invoice cooldown entries", len(expired))
+
 
 def _get_purchase_lock(user_id: int, product_id: str) -> asyncio.Lock:
     key = f"{user_id}:{product_id}"
     now = time.time()
 
-    # Чистим старые локи чтобы не росла память
-    expired = [k for k, ts in _purchase_locks_meta.items() if now - ts > _LOCK_TTL]
+    # Чистим старые локи, но ТОЛЬКО если они уже не заняты
+    expired = [
+        k for k, ts in _purchase_locks_meta.items()
+        if now - ts > _LOCK_TTL and not _purchase_locks.get(k, None) or
+           (k in _purchase_locks and not _purchase_locks[k].locked() and now - ts > _LOCK_TTL)
+    ]
     for k in expired:
-        _purchase_locks.pop(k, None)
-        _purchase_locks_meta.pop(k, None)
+        lock_obj = _purchase_locks.get(k)
+        if lock_obj is None or not lock_obj.locked():
+            _purchase_locks.pop(k, None)
+            _purchase_locks_meta.pop(k, None)
 
     if key not in _purchase_locks:
         _purchase_locks[key] = asyncio.Lock()
@@ -134,7 +162,34 @@ def help_inline_kb() -> InlineKeyboardMarkup:
 
 
 # =========================
-# GOOGLE SHEETS API (ПОКУПКИ)
+# SQLite: БАЗА ПОКУПОК
+# Заменяет Google Sheets как основное хранилище.
+# Google Sheets опционально используется для зеркала/отчётности.
+# =========================
+
+def init_db() -> None:
+    """Создаёт таблицу purchases если её нет. Вызывать при старте."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS purchases (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                date         TEXT    NOT NULL,
+                user_id      TEXT    NOT NULL,
+                username     TEXT,
+                full_name    TEXT,
+                product_id   TEXT    NOT NULL,
+                product_title TEXT,
+                price_label  TEXT,
+                file_id      TEXT,
+                UNIQUE(user_id, product_id)
+            )
+        """)
+        conn.commit()
+    logger.info("SQLite DB ready: %s", DB_PATH)
+
+
+# =========================
+# Google Sheets: ЗЕРКАЛО (необязательно)
 # =========================
 
 _SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -143,43 +198,54 @@ _purchases_sheet_title: Optional[str] = None
 
 
 def _build_sheets_service():
-    """Синхронная инициализация сервиса — вызывать через run_in_executor."""
     global _sheets_service
     if _sheets_service is not None:
         return _sheets_service
-
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise RuntimeError("Не задан GOOGLE_SERVICE_ACCOUNT_JSON")
-
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not _GOOGLE_LIBS_AVAILABLE:
+        return None
     creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     creds = Credentials.from_service_account_info(creds_info, scopes=_SCOPES)
     _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
     return _sheets_service
 
 
-async def get_sheets_service():
-    """FIX #9: асинхронная обёртка — не блокирует event loop."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _build_sheets_service)
+async def _mirror_to_sheets(row: list) -> None:
+    """Зеркалирование покупки в Google Sheets. Молча игнорирует ошибки."""
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not PURCHASES_SHEET_ID:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        service = await loop.run_in_executor(None, _build_sheets_service)
+        if not service:
+            return
 
+        def _get_title():
+            global _purchases_sheet_title
+            if _purchases_sheet_title:
+                return _purchases_sheet_title
+            meta = service.spreadsheets().get(spreadsheetId=PURCHASES_SHEET_ID).execute()
+            sheets = meta.get("sheets", [])
+            if not sheets:
+                return None
+            _purchases_sheet_title = sheets[0]["properties"]["title"]
+            return _purchases_sheet_title
 
-async def get_purchases_sheet_title() -> str:
-    global _purchases_sheet_title
-    if _purchases_sheet_title:
-        return _purchases_sheet_title
+        sheet_title = await loop.run_in_executor(None, _get_title)
+        if not sheet_title:
+            return
 
-    service = await get_sheets_service()
+        def _append():
+            service.spreadsheets().values().append(
+                spreadsheetId=PURCHASES_SHEET_ID,
+                range=f"{sheet_title}!A:H",
+                valueInputOption="USER_ENTERED",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [row]}
+            ).execute()
 
-    def _get():
-        meta = service.spreadsheets().get(spreadsheetId=PURCHASES_SHEET_ID).execute()
-        sheets = meta.get("sheets", [])
-        if not sheets:
-            raise RuntimeError("В таблице покупок нет листов.")
-        return sheets[0]["properties"]["title"]
-
-    loop = asyncio.get_event_loop()
-    _purchases_sheet_title = await loop.run_in_executor(None, _get)
-    return _purchases_sheet_title
+        await loop.run_in_executor(None, _append)
+    except Exception as e:
+        logger.warning("Зеркало Sheets недоступно (не критично): %s", e)
 
 
 # =========================
@@ -211,26 +277,50 @@ def _to_bool(value: Any) -> bool:
 
 def _to_float_safe(value: Any, default: float = 0.0) -> float:
     """
-    FIX #5: безопасное преобразование в float.
-    Строки вида "1.5 USDT" не вызывают ValueError — считаются платными.
+    Безопасное преобразование в float.
+    Корректно обрабатывает строки вида "1.5 USDT" — извлекает число из начала.
+    Мусор типа "abc", "бесплатно" возвращает default и логирует warning.
     """
     if value is None:
         return default
     s = str(value).strip()
     if s == "":
         return default
+    # Сначала пробуем простой float
     try:
         return float(s)
     except (ValueError, TypeError):
-        # Если строка нечисловая (например "1.5 USDT") — точно не 0, считаем платным
-        return 1.0
+        pass
+    # Пробуем вытащить первое число из строки: "1.5 USDT" -> 1.5
+    m = re.match(r"^\s*([0-9]+(?:[.,][0-9]+)?)", s)
+    if m:
+        num_str = m.group(1).replace(",", ".")
+        try:
+            result = float(num_str)
+            logger.debug("_to_float_safe: извлёк %.4f из %r", result, s)
+            return result
+        except ValueError:
+            pass
+    # Настоящий мусор — логируем и возвращаем default (НЕ считаем платным автоматически)
+    logger.warning("_to_float_safe: не удалось разобрать %r, возвращаю default=%.1f", s, default)
+    return default
 
 
-def load_products() -> List[Dict[str, Any]]:
+def _sync_fetch_csv() -> str:
+    """Синхронная загрузка CSV товаров — вызывать через run_in_executor."""
+    r = requests.get(PRODUCTS_CSV_URL, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    r.encoding = "utf-8"
+    return r.text.strip()
+
+
+async def load_products() -> List[Dict[str, Any]]:
     """
     Колонки:
     product_id | title | description | price_xtr | price_crypto | crypto_asset |
     file_id | active | category | preview_file_id
+
+    Загрузка CSV через run_in_executor — не блокирует event loop.
     """
     global _products_cache
     ts, cached = _products_cache
@@ -238,10 +328,8 @@ def load_products() -> List[Dict[str, Any]]:
         return cached
 
     try:
-        r = requests.get(PRODUCTS_CSV_URL, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        r.encoding = "utf-8"
-        csv_text = r.text.strip()
+        loop = asyncio.get_running_loop()
+        csv_text = await loop.run_in_executor(None, _sync_fetch_csv)
         if not csv_text:
             logger.warning("CSV товаров пуст (нет доступа/не опубликовано).")
             return []
@@ -361,117 +449,102 @@ def products_keyboard(products: List[Dict[str, Any]], category_key: str) -> Inli
 
 
 # =========================
-# ЛОГ ПОКУПОК (с file_id в таблицу)
+# SQLite CRUD: ПОКУПКИ
 # =========================
 
-_purchases_cache: Tuple[float, List[Dict[str, str]]] = (0.0, [])
+def _db_user_has_purchase(user_id: int, product_id: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM purchases WHERE user_id=? AND product_id=?",
+            (str(user_id), str(product_id))
+        ).fetchone()
+    return row is not None
 
 
-def _sync_read_all_purchases_rows(service, sheet_title: str) -> List[Dict[str, str]]:
-    """Синхронное чтение строк — вызывать через run_in_executor."""
-    rng = f"{sheet_title}!A:Z"
-    resp = service.spreadsheets().values().get(
-        spreadsheetId=PURCHASES_SHEET_ID,
-        range=rng
-    ).execute()
-
-    values = resp.get("values", [])
-    if not values or len(values) < 2:
-        return []
-
-    headers = values[0]
-    rows = values[1:]
-
-    result: List[Dict[str, str]] = []
-    for r in rows:
-        d = {}
-        for i, h in enumerate(headers):
-            d[h] = r[i] if i < len(r) else ""
-        result.append(d)
-    return result
+def _db_get_user_purchases(user_id: int) -> List[Dict[str, str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM purchases WHERE user_id=? ORDER BY date DESC",
+            (str(user_id),)
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
-async def get_purchases_cached(force: bool = False) -> List[Dict[str, str]]:
-    """FIX #9: асинхронная обёртка для чтения покупок."""
-    global _purchases_cache
-    ts, cached = _purchases_cache
-    if not force and cached and (time.time() - ts) < PURCHASES_CACHE_TTL:
-        return cached
+def _db_get_purchase(user_id: int, product_id: str) -> Optional[Dict[str, str]]:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM purchases WHERE user_id=? AND product_id=?",
+            (str(user_id), str(product_id))
+        ).fetchone()
+    return dict(row) if row else None
 
-    service = await get_sheets_service()
-    sheet_title = await get_purchases_sheet_title()
-    loop = asyncio.get_event_loop()
-    rows = await loop.run_in_executor(None, _sync_read_all_purchases_rows, service, sheet_title)
-    _purchases_cache = (time.time(), rows)
-    return rows
+
+def _db_insert_purchase(user: "types.User", product: Dict[str, Any], price_label: str) -> bool:
+    """
+    INSERT OR IGNORE — если запись уже есть (user_id, product_id UNIQUE), ничего не произойдёт.
+    Возвращает True если запись была добавлена, False если уже существовала.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    username = f"@{user.username}" if user.username else ""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO purchases
+                   (date, user_id, username, full_name, product_id, product_title, price_label, file_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    now,
+                    str(user.id),
+                    username,
+                    user.full_name,
+                    product["product_id"],
+                    product["title"],
+                    str(price_label),
+                    product.get("file_id", ""),
+                )
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.exception("SQLite insert error: %s", e)
+        return False
 
 
 async def user_has_purchase(user_id: int, product_id: str) -> bool:
-    rows = await get_purchases_cached()
-    uid = str(user_id)
-    pid = str(product_id)
-    for r in rows:
-        if r.get("user_id") == uid and r.get("product_id") == pid:
-            return True
-    return False
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _db_user_has_purchase, user_id, product_id)
 
 
 async def get_user_purchase_row(user_id: int, product_id: str) -> Optional[Dict[str, str]]:
-    rows = await get_purchases_cached()
-    uid = str(user_id)
-    pid = str(product_id)
-    found = None
-    for r in rows:
-        if r.get("user_id") == uid and r.get("product_id") == pid:
-            found = r
-    return found
-
-
-def _sync_append_purchase(service, sheet_title: str, row: list):
-    """Синхронная запись строки — вызывать через run_in_executor."""
-    service.spreadsheets().values().append(
-        spreadsheetId=PURCHASES_SHEET_ID,
-        range=f"{sheet_title}!A:H",
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body={"values": [row]}
-    ).execute()
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _db_get_purchase, user_id, product_id)
 
 
 async def append_purchase_row(user: types.User, product: Dict[str, Any], price_label: str) -> bool:
     """
-    FIX #9: асинхронная запись через run_in_executor.
-    Пишем A:H:
-    date | user_id | username | full_name | product_id | product_title | price_xtr | file_id
+    Записывает покупку в SQLite (INSERT OR IGNORE — без дублей на уровне БД).
+    Параллельно зеркалирует в Google Sheets если настроено.
     """
-    try:
-        service = await get_sheets_service()
-        sheet_title = await get_purchases_sheet_title()
+    loop = asyncio.get_running_loop()
+    inserted = await loop.run_in_executor(None, _db_insert_purchase, user, product, price_label)
 
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        username = f"@{user.username}" if user.username else ""
-
-        row = [
-            now,
+    if inserted:
+        # Зеркало в Sheets — опционально, ошибки не критичны
+        mirror_row = [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             str(user.id),
-            username,
+            f"@{user.username}" if user.username else "",
             user.full_name,
             product["product_id"],
             product["title"],
             str(price_label),
             product.get("file_id", ""),
         ]
+        asyncio.create_task(_mirror_to_sheets(mirror_row))
 
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _sync_append_purchase, service, sheet_title, row)
-
-        global _purchases_cache
-        _purchases_cache = (0.0, [])
-        return True
-
-    except Exception as e:
-        logger.exception("Не удалось записать покупку в таблицу: %s", e)
-        return False
+    return True  # Даже если дубль — файл всё равно выдаём
 
 
 # =========================
@@ -484,7 +557,39 @@ def crypto_headers() -> Dict[str, str]:
     return {"Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN}
 
 
-def crypto_create_invoice(product: Dict[str, Any], user: types.User) -> Dict[str, Any]:
+def _sync_crypto_create_invoice(data: dict) -> Dict[str, Any]:
+    """Синхронный HTTP-запрос к Crypto Pay — вызывать через run_in_executor."""
+    r = requests.post(
+        f"{CRYPTO_PAY_BASE_URL}/createInvoice",
+        json=data,
+        headers=crypto_headers(),
+        timeout=HTTP_TIMEOUT
+    )
+    r.raise_for_status()
+    result = r.json()
+    if not result.get("ok"):
+        raise RuntimeError(f"Crypto Pay createInvoice error: {result}")
+    return result["result"]
+
+
+def _sync_crypto_get_invoice(invoice_id: int) -> Optional[Dict[str, Any]]:
+    """Синхронный HTTP-запрос к Crypto Pay — вызывать через run_in_executor."""
+    r = requests.post(
+        f"{CRYPTO_PAY_BASE_URL}/getInvoices",
+        json={"invoice_ids": [invoice_id]},
+        headers=crypto_headers(),
+        timeout=HTTP_TIMEOUT
+    )
+    r.raise_for_status()
+    result = r.json()
+    if not result.get("ok"):
+        raise RuntimeError(f"Crypto Pay getInvoices error: {result}")
+    items = result.get("result", {}).get("items", [])
+    return items[0] if items else None
+
+
+async def crypto_create_invoice(product: Dict[str, Any], user: types.User) -> Dict[str, Any]:
+    """Асинхронное создание invoice — не блокирует event loop."""
     amount, asset = get_crypto_amount_and_asset(product)
     payload = f"crypto:{user.id}:{product['product_id']}"
 
@@ -498,39 +603,14 @@ def crypto_create_invoice(product: Dict[str, Any], user: types.User) -> Dict[str
         "allow_anonymous": True
     }
 
-    r = requests.post(
-        f"{CRYPTO_PAY_BASE_URL}/createInvoice",
-        json=data,
-        headers=crypto_headers(),
-        timeout=HTTP_TIMEOUT
-    )
-    r.raise_for_status()
-    result = r.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(f"Crypto Pay createInvoice error: {result}")
-
-    return result["result"]
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _sync_crypto_create_invoice, data)
 
 
-def crypto_get_invoice(invoice_id: int) -> Optional[Dict[str, Any]]:
-    # FIX #1: invoice_ids должен быть СПИСКОМ, а не строкой
-    r = requests.post(
-        f"{CRYPTO_PAY_BASE_URL}/getInvoices",
-        json={"invoice_ids": [invoice_id]},
-        headers=crypto_headers(),
-        timeout=HTTP_TIMEOUT
-    )
-    r.raise_for_status()
-    result = r.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(f"Crypto Pay getInvoices error: {result}")
-
-    items = result.get("result", {}).get("items", [])
-    if not items:
-        return None
-    return items[0]
+async def crypto_get_invoice(invoice_id: int) -> Optional[Dict[str, Any]]:
+    """Асинхронная проверка invoice — не блокирует event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _sync_crypto_get_invoice, invoice_id)
 
 
 # =========================
@@ -612,7 +692,8 @@ async def cmd_start(message: types.Message):
     args = message.get_args()
     if args and args.startswith("buy_stars_"):
         pid = args.replace("buy_stars_", "", 1).strip()
-        product = next((p for p in load_products() if p["product_id"] == pid), None)
+        _all_products = await load_products()
+        product = next((p for p in _all_products if p["product_id"] == pid), None)
         if product:
             await message.answer(START_TEXT, reply_markup=main_menu())
             text = format_product_card(product)
@@ -646,7 +727,7 @@ async def cmd_help(message: types.Message):
 
 @dp.message_handler(lambda m: m.text and "Каталог" in m.text)
 async def show_categories(message: types.Message):
-    products = load_products()
+    products = await load_products()
     if not products:
         await message.answer("Пока нет доступных материалов.", reply_markup=main_menu())
         return
@@ -665,9 +746,8 @@ async def show_my_purchases(message: types.Message):
 
 
 async def send_my_purchases(chat_id: int, user: types.User):
-    rows = await get_purchases_cached()
-    uid = str(user.id)
-    user_rows = [r for r in rows if r.get("user_id") == uid]
+    loop = asyncio.get_running_loop()
+    user_rows = await loop.run_in_executor(None, _db_get_user_purchases, user.id)
 
     if not user_rows:
         kb = InlineKeyboardMarkup().add(InlineKeyboardButton("📚 Каталог", callback_data="open:catalog"))
@@ -678,7 +758,7 @@ async def send_my_purchases(chat_id: int, user: types.User):
         )
         return
 
-    products = load_products()
+    products = await load_products()
     prod_map = {p["product_id"]: p for p in products}
 
     seen = set()
@@ -695,7 +775,7 @@ async def send_my_purchases(chat_id: int, user: types.User):
         pid = _to_str(r.get("product_id"))
         title = _to_str(r.get("product_title")) or prod_map.get(pid, {}).get("title", "PDF")
 
-        price_from_row = _to_str(r.get("price_xtr"))
+        price_from_row = _to_str(r.get("price_label") or r.get("price_xtr"))
         is_free_row = (price_from_row == "" or price_from_row == "0")
 
         emoji = "🎁" if is_free_row else "⭐"
@@ -710,7 +790,7 @@ async def send_my_purchases(chat_id: int, user: types.User):
 @dp.callback_query_handler(lambda c: c.data == "open:catalog")
 async def cb_open_catalog(call: types.CallbackQuery):
     await call.answer()
-    products = load_products()
+    products = await load_products()
     if not products:
         await bot.send_message(call.message.chat.id, "Пока нет доступных материалов.", reply_markup=main_menu())
         return
@@ -728,7 +808,7 @@ async def cb_category(call: types.CallbackQuery):
     category = _cat_key_to_name.get(key)
 
     if not category:
-        products_all = load_products()
+        products_all = await load_products()
         cats = sorted(set(_to_str(p.get("category", "")) for p in products_all if p.get("category")))
         for c in cats:
             _cat_key_to_name[_cat_key(c)] = c
@@ -738,7 +818,8 @@ async def cb_category(call: types.CallbackQuery):
         await call.answer("Категория устарела. Откройте каталог заново.", show_alert=True)
         return
 
-    products = [p for p in load_products() if _to_str(p.get("category", "")) == category]
+    _all_products = await load_products()
+    products = [p for p in _all_products if _to_str(p.get("category", "")) == category]
     if not products:
         await call.answer("Пока пусто.", show_alert=True)
         return
@@ -825,7 +906,8 @@ async def cb_item(call: types.CallbackQuery):
     pid = parts[1].strip()
     category_key = parts[2].strip()
 
-    product = next((p for p in load_products() if p["product_id"] == pid), None)
+    _all_products = await load_products()
+    product = next((p for p in _all_products if p["product_id"] == pid), None)
     if not product:
         await call.answer("Материал не найден.", show_alert=True)
         return
@@ -868,7 +950,7 @@ async def cb_back_items(call: types.CallbackQuery):
     category = _cat_key_to_name.get(category_key)
 
     if not category:
-        products_all = load_products()
+        products_all = await load_products()
         cats = sorted(set(_to_str(p.get("category", "")) for p in products_all if p.get("category")))
         for c in cats:
             _cat_key_to_name[_cat_key(c)] = c
@@ -878,7 +960,8 @@ async def cb_back_items(call: types.CallbackQuery):
         await call.answer("Категория устарела. Откройте каталог заново.", show_alert=True)
         return
 
-    products = [p for p in load_products() if _to_str(p.get("category", "")) == category]
+    _all_products = await load_products()
+    products = [p for p in _all_products if _to_str(p.get("category", "")) == category]
     if not products:
         await call.answer("В категории пока нет товаров.", show_alert=True)
         return
@@ -907,7 +990,8 @@ async def cb_back_items(call: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("get:"))
 async def cb_get_free(call: types.CallbackQuery):
     pid = call.data.split("get:", 1)[1].strip()
-    product = next((p for p in load_products() if p["product_id"] == pid), None)
+    _all_products = await load_products()
+    product = next((p for p in _all_products if p["product_id"] == pid), None)
     if not product:
         await call.answer("Материал не найден.", show_alert=True)
         return
@@ -931,7 +1015,8 @@ async def cb_get_free(call: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("paystars:"))
 async def cb_pay_stars(call: types.CallbackQuery):
     pid = call.data.split("paystars:", 1)[1].strip()
-    product = next((p for p in load_products() if p["product_id"] == pid), None)
+    _all_products = await load_products()
+    product = next((p for p in _all_products if p["product_id"] == pid), None)
     if not product:
         await call.answer("Материал не найден.", show_alert=True)
         return
@@ -965,7 +1050,8 @@ async def cb_pay_stars(call: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data.startswith("paycrypto:"))
 async def cb_pay_crypto(call: types.CallbackQuery):
     pid = call.data.split("paycrypto:", 1)[1].strip()
-    product = next((p for p in load_products() if p["product_id"] == pid), None)
+    _all_products = await load_products()
+    product = next((p for p in _all_products if p["product_id"] == pid), None)
     if not product:
         await call.answer("Материал не найден.", show_alert=True)
         return
@@ -983,9 +1069,21 @@ async def cb_pay_crypto(call: types.CallbackQuery):
         await call.answer("Крипто-оплата пока не настроена.", show_alert=True)
         return
 
+    # Шаг 3: защита от дублирующих invoice — проверяем cooldown
+    dedup_key = f"{user.id}:{pid}"
+    last_created = _crypto_invoice_created_at.get(dedup_key, 0)
+    if time.time() - last_created < _CRYPTO_INVOICE_COOLDOWN:
+        await call.answer(
+            "Счёт уже был создан недавно. Подождите минуту или нажмите «Я оплатил, проверить» выше.",
+            show_alert=True
+        )
+        return
+
     try:
         amount, asset = get_crypto_amount_and_asset(product)
-        invoice = crypto_create_invoice(product, user)
+        invoice = await crypto_create_invoice(product, user)
+        _crypto_invoice_created_at[dedup_key] = time.time()
+        _cleanup_invoice_cooldown()  # Чистим устаревшие записи попутно
         invoice_id = invoice["invoice_id"]
         pay_url = invoice.get("bot_invoice_url") or invoice.get("pay_url")
 
@@ -1022,7 +1120,8 @@ async def cb_check_crypto(call: types.CallbackQuery):
         await call.answer("Некорректная кнопка.", show_alert=True)
         return
 
-    product = next((p for p in load_products() if p["product_id"] == pid), None)
+    _all_products = await load_products()
+    product = next((p for p in _all_products if p["product_id"] == pid), None)
     if not product:
         await call.answer("Материал не найден.", show_alert=True)
         return
@@ -1036,7 +1135,7 @@ async def cb_check_crypto(call: types.CallbackQuery):
 
     try:
         # FIX #1 применён внутри crypto_get_invoice — передаём список
-        invoice = crypto_get_invoice(invoice_id)
+        invoice = await crypto_get_invoice(invoice_id)
         if not invoice:
             await call.answer("Счёт не найден.", show_alert=True)
             return
@@ -1054,6 +1153,24 @@ async def cb_check_crypto(call: types.CallbackQuery):
             return
 
         amount, asset = get_crypto_amount_and_asset(product)
+
+        # Проверяем что сумма и валюта в invoice совпадают с товаром
+        invoice_amount = _to_str(invoice.get("amount", ""))
+        invoice_asset = _to_str(invoice.get("asset", "")).upper()
+        if invoice_amount and invoice_amount != amount:
+            logger.warning(
+                "Invoice amount mismatch: expected=%s got=%s user=%s product=%s",
+                amount, invoice_amount, user.id, pid
+            )
+            await call.answer("Сумма оплаты не совпадает с ценой товара. Напишите в поддержку.", show_alert=True)
+            return
+        if invoice_asset and invoice_asset != asset:
+            logger.warning(
+                "Invoice asset mismatch: expected=%s got=%s user=%s product=%s",
+                asset, invoice_asset, user.id, pid
+            )
+            await call.answer("Валюта оплаты не совпадает. Напишите в поддержку.", show_alert=True)
+            return
 
         ok = await grant_product_to_user(
             chat_id=call.message.chat.id,
@@ -1095,7 +1212,8 @@ async def cb_download(call: types.CallbackQuery):
     file_id_from_row = _to_str(purchase_row.get("file_id"))
 
     if not file_id_from_row:
-        product = next((p for p in load_products() if p["product_id"] == pid), None)
+        _all_products = await load_products()
+        product = next((p for p in _all_products if p["product_id"] == pid), None)
         if not product:
             await call.answer("Не удалось получить файл. Напишите в поддержку через /help.", show_alert=True)
             return
@@ -1123,7 +1241,8 @@ async def successful_payment(message: types.Message):
         return
 
     pid = payload.split("buystars:", 1)[1].strip()
-    product = next((p for p in load_products() if p["product_id"] == pid), None)
+    _all_products = await load_products()
+    product = next((p for p in _all_products if p["product_id"] == pid), None)
     if not product:
         await message.answer("Оплата получена, но материал сейчас недоступен.")
         return
@@ -1167,12 +1286,11 @@ async def successful_payment(message: types.Message):
 
 @dp.message_handler(commands=["refresh"], user_id=[ADMIN_CHAT_ID])
 async def cmd_refresh(message: types.Message):
-    global _products_cache, _purchases_cache, _purchases_sheet_title
+    global _products_cache, _purchases_sheet_title
     _products_cache = (0.0, [])
-    _purchases_cache = (0.0, [])
     _purchases_sheet_title = None
     logger.info("Admin triggered cache refresh")
-    await message.answer("✅ Кеши очищены. Следующая загрузка будет с нуля.")
+    await message.answer("✅ Кеш товаров очищен. Следующая загрузка CSV будет с нуля.")
 
 
 @dp.message_handler(content_types=types.ContentType.DOCUMENT, user_id=[ADMIN_CHAT_ID])
@@ -1193,4 +1311,5 @@ async def debug_get_file_id_photo(message: types.Message):
 
 
 if __name__ == "__main__":
+    init_db()
     executor.start_polling(dp, skip_updates=True)
