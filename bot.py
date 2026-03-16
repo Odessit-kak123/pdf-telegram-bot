@@ -103,6 +103,10 @@ _LOCK_TTL = 300  # 5 минут, потом чистим
 # Шаг 3: защита от дублирующих crypto-invoice
 _crypto_invoice_created_at: Dict[str, float] = {}
 
+# Превью товаров: chat_id -> set(product_id) — уже показанные фото в этой сессии
+# Не отправляем одно и то же фото дважды подряд в один чат
+_preview_shown: Dict[int, str] = {}  # chat_id -> последний показанный product_id
+
 
 _CRYPTO_INVOICE_COOLDOWN = 60   # секунд между созданиями invoice для одного товара
 _CRYPTO_INVOICE_MAX_AGE = 3600  # старше 1 часа — чистим из словаря
@@ -845,6 +849,7 @@ async def cb_open_purchases(call: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == "open:start")
 async def cb_open_start(call: types.CallbackQuery):
     await call.answer()
+    _preview_shown.pop(call.message.chat.id, None)  # сбрасываем при выходе на главную
     try:
         await call.message.edit_text(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
     except Exception:
@@ -992,15 +997,17 @@ async def cb_item(call: types.CallbackQuery):
     preview_id = _to_str(product.get("preview_file_id"))
     chat_id = call.message.chat.id
 
-    # Шаг 1: отправляем фото отдельно — без кнопок, только иллюстрация
-    if preview_id:
+    # Шаг 1: фото — только если этот товар ещё не показывали в этом чате
+    pid_str = product["product_id"]
+    already_shown = _preview_shown.get(chat_id) == pid_str
+    if preview_id and not already_shown:
         try:
             await bot.send_photo(chat_id=chat_id, photo=preview_id)
+            _preview_shown[chat_id] = pid_str
         except Exception as e:
             logger.warning("Не удалось отправить превью: %s", e)
 
-    # Шаг 2: карточка с описанием и кнопками — текстовое сообщение
-    # Оно будет редактироваться при навигации "Назад"
+    # Шаг 2: карточка с описанием и кнопками — текстовое, редактируется при "Назад"
     try:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
