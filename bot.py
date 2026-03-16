@@ -990,31 +990,21 @@ async def cb_item(call: types.CallbackQuery):
     text = format_product_card(product)
     kb = product_action_kb(product, category_key=category_key)
     preview_id = _to_str(product.get("preview_file_id"))
+    chat_id = call.message.chat.id
 
+    # Шаг 1: отправляем фото отдельно — без кнопок, только иллюстрация
     if preview_id:
         try:
-            await bot.send_photo(
-                chat_id=call.message.chat.id,
-                photo=preview_id,
-                caption=text,
-                reply_markup=kb,
-                parse_mode="HTML"
-            )
+            await bot.send_photo(chat_id=chat_id, photo=preview_id)
         except Exception as e:
-            logger.exception("Не удалось отправить превью, fallback на текст: %s", e)
-            await bot.send_message(
-                call.message.chat.id,
-                text,
-                reply_markup=kb,
-                parse_mode="HTML"
-            )
-    else:
-        await bot.send_message(
-            call.message.chat.id,
-            text,
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
+            logger.warning("Не удалось отправить превью: %s", e)
+
+    # Шаг 2: карточка с описанием и кнопками — текстовое сообщение
+    # Оно будет редактироваться при навигации "Назад"
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("back_items:"))
@@ -1042,18 +1032,9 @@ async def cb_back_items(call: types.CallbackQuery):
     text = f"📂 <b>{category}</b>\n\nВыберите материал:"
     kb = products_keyboard(products, category_key=category_key)
 
+    # Карточка товара теперь всегда текстовая — просто редактируем на месте
     try:
-        msg = call.message
-        if msg.photo:
-            # Карточка с фото — убираем кнопки чтобы она выглядела "закрытой"
-            try:
-                await msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup())
-            except Exception:
-                pass
-            # Список идёт следующим сообщением
-            await bot.send_message(msg.chat.id, text, reply_markup=kb, parse_mode="HTML")
-        else:
-            await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
         logger.exception("edit back_items failed: %s", e)
         await bot.send_message(call.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
