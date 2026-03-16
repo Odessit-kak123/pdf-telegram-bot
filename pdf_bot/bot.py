@@ -428,19 +428,24 @@ def _cat_key(name: str) -> str:
 
 def categories_keyboard(categories: List[str]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
-    # FIX #4: не чистим весь словарь, просто добавляем/обновляем ключи
     for c in categories:
         c_clean = _to_str(c)
         key = _cat_key(c_clean)
         _cat_key_to_name[key] = c_clean
         kb.add(InlineKeyboardButton(text=c_clean, callback_data=f"catk:{key}"))
+    kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
     return kb
 
 
 def products_keyboard(products: List[Dict[str, Any]], category_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
     for p in products:
-        emoji = "🎁" if is_free_product(p) else "⭐"
+        if is_free_product(p):
+            emoji = "🎁"
+        elif int(p.get("price_xtr", 0) or 0) > 0:
+            emoji = "⭐"
+        else:
+            emoji = "💰"
         btn_text = f"{emoji} {p['title']}"
         kb.add(
             InlineKeyboardButton(
@@ -448,6 +453,8 @@ def products_keyboard(products: List[Dict[str, Any]], category_key: str) -> Inli
                 callback_data=f"item:{p['product_id']}:{category_key}"
             )
         )
+    kb.add(InlineKeyboardButton("🔙 К категориям", callback_data="open:catalog"))
+    kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
     return kb
 
 
@@ -679,14 +686,27 @@ async def notify_admin_purchase(
 # =========================
 
 START_TEXT = (
-    "👋 Привет!\n"
-    "В этом боте собраны развивающие PDF для детей 🎨📚\n\n"
-    "Здесь вы найдёте:\n"
+    "👋 <b>Привет!</b>\n\n"
+    "Здесь собраны развивающие PDF-материалы для детей 🎨📚\n\n"
     "🎨 Разукрашки и творческие задания\n"
     "📖 Обучающие и научные сказки\n"
-    "🧠 Развивающие игры и вопросы\n\n"
-    "👇 Нажмите «Каталог», чтобы выбрать материалы"
+    "🧠 Развивающие игры и вопросы\n"
+    "🎁 Бесплатные материалы\n\n"
+    "Выберите раздел 👇"
 )
+
+
+def start_inline_kb() -> InlineKeyboardMarkup:
+    """Красивое inline-меню вместо ReplyKeyboard на старте."""
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📚 Каталог", callback_data="open:catalog"),
+        InlineKeyboardButton("📂 Мои покупки", callback_data="open:purchases"),
+    )
+    kb.add(
+        InlineKeyboardButton("✉️ Поддержка", url=f"https://t.me/{AUTHOR_USERNAME}")
+    )
+    return kb
 
 
 @dp.message_handler(commands=["start"])
@@ -698,7 +718,7 @@ async def cmd_start(message: types.Message):
         _all_products = await load_products()
         product = next((p for p in _all_products if p["product_id"] == pid), None)
         if product:
-            await message.answer(START_TEXT, reply_markup=main_menu())
+            await message.answer(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
             text = format_product_card(product)
             kb = product_action_kb(product, category_key=_cat_key(_to_str(product.get("category", ""))))
             preview_id = _to_str(product.get("preview_file_id"))
@@ -717,7 +737,7 @@ async def cmd_start(message: types.Message):
             await message.answer(text, reply_markup=kb, parse_mode="HTML")
             return
 
-    await message.answer(START_TEXT, reply_markup=main_menu())
+    await message.answer(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
 
 
 @dp.message_handler(commands=["help", "support"])
@@ -732,11 +752,15 @@ async def cmd_help(message: types.Message):
 async def show_categories(message: types.Message):
     products = await load_products()
     if not products:
-        await message.answer("Пока нет доступных материалов.", reply_markup=main_menu())
+        await message.answer("Пока нет доступных материалов.")
         return
 
     categories = sorted(set(_to_str(p.get("category", "")) for p in products if p.get("category")))
-    await message.answer("📚 Выберите категорию:", reply_markup=categories_keyboard(categories))
+    await message.answer(
+        "📚 <b>Каталог</b>\n\nВыберите категорию:",
+        reply_markup=categories_keyboard(categories),
+        parse_mode="HTML"
+    )
 
 
 # =========================
@@ -753,11 +777,14 @@ async def send_my_purchases(chat_id: int, user: types.User):
     user_rows = await loop.run_in_executor(None, _db_get_user_purchases, user.id)
 
     if not user_rows:
-        kb = InlineKeyboardMarkup().add(InlineKeyboardButton("📚 Каталог", callback_data="open:catalog"))
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("📚 Перейти в каталог", callback_data="open:catalog"))
+        kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
         await bot.send_message(
             chat_id,
-            "У вас пока нет покупок 🙌\n\nПерейдите в каталог, чтобы выбрать материалы.",
-            reply_markup=kb
+            "📂 <b>Мои покупки</b>\n\nУ вас пока нет покупок 🙌\nПерейдите в каталог, чтобы выбрать материалы.",
+            reply_markup=kb,
+            parse_mode="HTML"
         )
         return
 
@@ -795,10 +822,31 @@ async def cb_open_catalog(call: types.CallbackQuery):
     await call.answer()
     products = await load_products()
     if not products:
-        await bot.send_message(call.message.chat.id, "Пока нет доступных материалов.", reply_markup=main_menu())
+        await call.message.answer("Пока нет доступных материалов.")
         return
     categories = sorted(set(_to_str(p.get("category", "")) for p in products if p.get("category")))
-    await bot.send_message(call.message.chat.id, "📚 Выберите категорию:", reply_markup=categories_keyboard(categories))
+    text = "📚 <b>Каталог</b>\n\nВыберите категорию:"
+    kb = categories_keyboard(categories)
+    # Одноэкранная навигация: редактируем текущее сообщение
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query_handler(lambda c: c.data == "open:purchases")
+async def cb_open_purchases(call: types.CallbackQuery):
+    await call.answer()
+    await send_my_purchases(call.message.chat.id, call.from_user)
+
+
+@dp.callback_query_handler(lambda c: c.data == "open:start")
+async def cb_open_start(call: types.CallbackQuery):
+    await call.answer()
+    try:
+        await call.message.edit_text(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
+    except Exception:
+        await call.message.answer(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
 
 
 # =========================
@@ -827,7 +875,12 @@ async def cb_category(call: types.CallbackQuery):
         await call.answer("Пока пусто.", show_alert=True)
         return
 
-    await call.message.answer(f"📂 {category}", reply_markup=products_keyboard(products, category_key=key))
+    text = f"📂 <b>{category}</b>\n\nВыберите материал:"
+    kb = products_keyboard(products, category_key=key)
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
 
@@ -873,6 +926,12 @@ def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeybo
             callback_data=f"back_items:{category_key}"
         )
     )
+    kb.add(
+        InlineKeyboardButton(
+            "🏠 Главная",
+            callback_data="open:start"
+        )
+    )
 
     return kb
 
@@ -884,19 +943,28 @@ def format_product_card(product: Dict[str, Any]) -> str:
     price_xtr = int(product.get("price_xtr", 0) or 0)
     price_crypto_raw = _to_str(product.get("price_crypto", ""))
     crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
+    category = _to_str(product.get("category", ""))
 
+    # Цена
     if is_free_product(product):
-        price_line = "🎁 Бесплатно"
+        price_line = "🎁 <b>Бесплатно</b>"
+    elif price_xtr > 0 and price_crypto_raw:
+        price_line = f"⭐ <b>{price_xtr} Stars</b>  |  💰 <b>{price_crypto_raw} {crypto_asset}</b>"
     elif price_xtr > 0:
-        price_line = f"⭐ Цена: {price_xtr} Stars"
+        price_line = f"⭐ <b>{price_xtr} Stars</b>"
     else:
-        price_line = "💰 Оплата криптой"
+        price_line = f"💰 <b>{price_crypto_raw} {crypto_asset}</b>"
 
-    crypto_line = ""
-    if price_crypto_raw and crypto_asset:
-        crypto_line = f"\n₿ Криптой: {price_crypto_raw} {crypto_asset}"
+    # Категория badge
+    cat_line = f"\n<i>📂 {category}</i>" if category else ""
 
-    return f"📄 <b>{title}</b>\n\n{desc}\n\n{price_line}{crypto_line}"
+    return (
+        f"📄 <b>{title}</b>{cat_line}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{desc}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{price_line}"
+    )
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("item:"))
@@ -969,23 +1037,23 @@ async def cb_back_items(call: types.CallbackQuery):
         await call.answer("В категории пока нет товаров.", show_alert=True)
         return
 
-    text = f"📂 {category}"
+    text = f"📂 <b>{category}</b>\n\nВыберите материал:"
     kb = products_keyboard(products, category_key=category_key)
 
     try:
         msg = call.message
         if msg.photo:
-            # Фото нельзя заменить текстом — удаляем карточку и отправляем список заново
+            # Фото → убираем кнопки, шлём текст новым сообщением
             try:
-                await msg.delete()
+                await msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup())
             except Exception:
-                pass  # Если удалить не получилось — не страшно, просто отправим ниже
+                pass
             await bot.send_message(call.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
         else:
             await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
-        logger.exception("edit back_items failed, fallback to answer(): %s", e)
-        await call.message.answer(text, reply_markup=kb)
+        logger.exception("edit back_items failed: %s", e)
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
 
     await call.answer()
 
@@ -1317,6 +1385,42 @@ async def debug_get_file_id_photo(message: types.Message):
     )
 
 
-if __name__ == "__main__":
+# =========================
+# WEBHOOK / POLLING — автовыбор
+# =========================
+
+WEBHOOK_HOST = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}" if WEBHOOK_HOST else ""
+WEBAPP_PORT = int(os.getenv("PORT", 8080))
+
+
+async def on_startup(dp):
     init_db()
-    executor.start_polling(dp, skip_updates=True)
+    if WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL)
+        logger.info("Webhook set: %s", WEBHOOK_URL)
+    else:
+        logger.info("No RAILWAY_PUBLIC_DOMAIN — using polling")
+
+
+async def on_shutdown(dp):
+    if WEBHOOK_URL:
+        await bot.delete_webhook()
+
+
+if __name__ == "__main__":
+    if WEBHOOK_URL:
+        # aiogram 2.x встроенный webhook через executor
+        executor.start_webhook(
+            dispatcher=dp,
+            webhook_path=WEBHOOK_PATH,
+            on_startup=on_startup,
+            on_shutdown=on_shutdown,
+            skip_updates=True,
+            host="0.0.0.0",
+            port=WEBAPP_PORT,
+        )
+    else:
+        init_db()
+        executor.start_polling(dp, skip_updates=True)
