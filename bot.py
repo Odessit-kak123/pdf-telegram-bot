@@ -10,6 +10,7 @@ import hashlib
 import sqlite3
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
+from decimal import Decimal, InvalidOperation
 
 import requests
 from aiogram import Bot, Dispatcher, types
@@ -178,9 +179,18 @@ def help_inline_kb() -> InlineKeyboardMarkup:
 # Google Sheets опционально используется для зеркала/отчётности.
 # =========================
 
+def _get_db() -> sqlite3.Connection:
+    """Открывает соединение с SQLite с нужными настройками."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL;")   # WAL — безопасно при конкурентных записях
+    conn.execute("PRAGMA busy_timeout=5000;")  # 5 сек ожидания если БД занята
+    conn.execute("PRAGMA synchronous=NORMAL;") # Баланс скорость/надёжность
+    return conn
+
+
 def init_db() -> None:
     """Создаёт таблицу purchases если её нет. Вызывать при старте."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with _get_db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS purchases (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -343,9 +353,15 @@ async def load_products() -> List[Dict[str, Any]]:
         csv_text = await loop.run_in_executor(None, _sync_fetch_csv)
         if not csv_text:
             logger.warning("CSV товаров пуст (нет доступа/не опубликовано).")
+            if cached:
+                logger.warning("Возвращаем устаревший кеш товаров (CSV пуст).")
+                return cached
             return []
     except Exception as e:
         logger.exception("Не удалось загрузить CSV товаров: %s", e)
+        if cached:
+            logger.warning("Возвращаем устаревший кеш товаров (ошибка загрузки).")
+            return cached
         return []
 
     products: List[Dict[str, Any]] = []
@@ -471,7 +487,7 @@ def products_keyboard(products: List[Dict[str, Any]], category_key: str) -> Inli
 # =========================
 
 def _db_user_has_purchase(user_id: int, product_id: str) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _get_db() as conn:
         row = conn.execute(
             "SELECT 1 FROM purchases WHERE user_id=? AND product_id=?",
             (str(user_id), str(product_id))
@@ -480,7 +496,7 @@ def _db_user_has_purchase(user_id: int, product_id: str) -> bool:
 
 
 def _db_get_user_purchases(user_id: int) -> List[Dict[str, str]]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _get_db() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM purchases WHERE user_id=? ORDER BY date DESC",
@@ -490,7 +506,7 @@ def _db_get_user_purchases(user_id: int) -> List[Dict[str, str]]:
 
 
 def _db_get_purchase(user_id: int, product_id: str) -> Optional[Dict[str, str]]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with _get_db() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM purchases WHERE user_id=? AND product_id=?",
@@ -499,15 +515,18 @@ def _db_get_purchase(user_id: int, product_id: str) -> Optional[Dict[str, str]]:
     return dict(row) if row else None
 
 
-def _db_insert_purchase(user: "types.User", product: Dict[str, Any], price_label: str) -> bool:
+def _db_insert_purchase(user: "types.User", product: Dict[str, Any], price_label: str) -> str:
     """
-    INSERT OR IGNORE — если запись уже есть (user_id, product_id UNIQUE), ничего не произойдёт.
-    Возвращает True если запись была добавлена, False если уже существовала.
+    Вставляет покупку в БД.
+    Возвращает:
+      "inserted" — новая запись создана
+      "exists"   — запись уже была (дубль), это нормально
+      "error"    — реальная ошибка БД, файл выдавать нельзя
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     username = f"@{user.username}" if user.username else ""
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with _get_db() as conn:
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO purchases
                    (date, user_id, username, full_name, product_id, product_title, price_label, file_id)
@@ -524,10 +543,10 @@ def _db_insert_purchase(user: "types.User", product: Dict[str, Any], price_label
                 )
             )
             conn.commit()
-            return cursor.rowcount > 0
+            return "inserted" if cursor.rowcount > 0 else "exists"
     except Exception as e:
         logger.exception("SQLite insert error: %s", e)
-        return False
+        return "error"
 
 
 async def user_has_purchase(user_id: int, product_id: str) -> bool:
@@ -542,14 +561,22 @@ async def get_user_purchase_row(user_id: int, product_id: str) -> Optional[Dict[
 
 async def append_purchase_row(user: types.User, product: Dict[str, Any], price_label: str) -> bool:
     """
-    Записывает покупку в SQLite (INSERT OR IGNORE — без дублей на уровне БД).
-    Параллельно зеркалирует в Google Sheets если настроено.
+    Записывает покупку в SQLite.
+    Возвращает True если можно выдавать файл (inserted или exists).
+    Возвращает False только при реальной ошибке БД.
     """
     loop = asyncio.get_running_loop()
-    inserted = await loop.run_in_executor(None, _db_insert_purchase, user, product, price_label)
+    status = await loop.run_in_executor(None, _db_insert_purchase, user, product, price_label)
 
-    if inserted:
-        # Зеркало в Sheets — опционально, ошибки не критичны
+    if status == "error":
+        logger.error(
+            "DB insert failed for user=%s product=%s — файл НЕ выдаём",
+            user.id, product.get("product_id")
+        )
+        return False  # Реальная ошибка — не выдаём файл
+
+    if status == "inserted":
+        # Новая покупка — зеркалируем в Sheets
         mirror_row = [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             str(user.id),
@@ -562,7 +589,8 @@ async def append_purchase_row(user: types.User, product: Dict[str, Any], price_l
         ]
         asyncio.create_task(_mirror_to_sheets(mirror_row))
 
-    return True  # Даже если дубль — файл всё равно выдаём
+    # "inserted" или "exists" — в обоих случаях выдаём файл
+    return True
 
 
 # =========================
@@ -764,7 +792,7 @@ async def show_categories(message: types.Message):
         return
 
     categories = sorted(set(_to_str(p.get("category", "")) for p in products if p.get("category")))
-    sent = await message.answer(
+    await message.answer(
         "📚 <b>Каталог</b>\n\nВыберите категорию:",
         reply_markup=categories_keyboard(categories),
         parse_mode="HTML"
@@ -1315,16 +1343,20 @@ async def cb_check_crypto(call: types.CallbackQuery):
 
         amount, asset = get_crypto_amount_and_asset(product)
 
-        # Проверяем что сумма и валюта в invoice совпадают с товаром
+        # Проверяем сумму через Decimal — "1.5" и "1.50" считаются равными
         invoice_amount = _to_str(invoice.get("amount", ""))
         invoice_asset = _to_str(invoice.get("asset", "")).upper()
-        if invoice_amount and invoice_amount != amount:
-            logger.warning(
-                "Invoice amount mismatch: expected=%s got=%s user=%s product=%s",
-                amount, invoice_amount, user.id, pid
-            )
-            await call.answer("Сумма оплаты не совпадает с ценой товара. Напишите в поддержку.", show_alert=True)
-            return
+        if invoice_amount:
+            try:
+                if Decimal(invoice_amount) != Decimal(amount):
+                    logger.warning(
+                        "Invoice amount mismatch: expected=%s got=%s user=%s product=%s",
+                        amount, invoice_amount, user.id, pid
+                    )
+                    await call.answer("Сумма оплаты не совпадает с ценой товара. Напишите в поддержку.", show_alert=True)
+                    return
+            except InvalidOperation:
+                logger.warning("Не удалось сравнить суммы: %s vs %s", invoice_amount, amount)
         if invoice_asset and invoice_asset != asset:
             logger.warning(
                 "Invoice asset mismatch: expected=%s got=%s user=%s product=%s",
