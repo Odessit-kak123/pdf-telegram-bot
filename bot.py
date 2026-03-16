@@ -103,9 +103,9 @@ _LOCK_TTL = 300  # 5 минут, потом чистим
 # Шаг 3: защита от дублирующих crypto-invoice
 _crypto_invoice_created_at: Dict[str, float] = {}
 
-# Превью товаров: chat_id -> set(product_id) — уже показанные фото в этой сессии
-# Не отправляем одно и то же фото дважды подряд в один чат
-_preview_shown: Dict[int, str] = {}  # chat_id -> последний показанный product_id
+# Превью товаров: chat_id -> (product_id, photo_message_id)
+# Храним message_id фото чтобы удалять его при переходе на другой товар
+_preview_shown: Dict[int, tuple] = {}  # chat_id -> (product_id, msg_id)
 
 
 _CRYPTO_INVOICE_COOLDOWN = 60   # секунд между созданиями invoice для одного товара
@@ -826,6 +826,13 @@ async def send_my_purchases(chat_id: int, user: types.User):
 @dp.callback_query_handler(lambda c: c.data == "open:catalog")
 async def cb_open_catalog(call: types.CallbackQuery):
     await call.answer()
+    # Удаляем фото превью если есть
+    prev = _preview_shown.pop(call.message.chat.id, None)
+    if prev:
+        try:
+            await bot.delete_message(call.message.chat.id, prev[1])
+        except Exception:
+            pass
     products = await load_products()
     if not products:
         await call.message.answer("Пока нет доступных материалов.")
@@ -849,7 +856,13 @@ async def cb_open_purchases(call: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == "open:start")
 async def cb_open_start(call: types.CallbackQuery):
     await call.answer()
-    _preview_shown.pop(call.message.chat.id, None)  # сбрасываем при выходе на главную
+    # Удаляем фото превью если есть
+    prev = _preview_shown.pop(call.message.chat.id, None)
+    if prev:
+        try:
+            await bot.delete_message(call.message.chat.id, prev[1])
+        except Exception:
+            pass
     try:
         await call.message.edit_text(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
     except Exception:
@@ -997,13 +1010,24 @@ async def cb_item(call: types.CallbackQuery):
     preview_id = _to_str(product.get("preview_file_id"))
     chat_id = call.message.chat.id
 
-    # Шаг 1: фото — только если этот товар ещё не показывали в этом чате
+    # Шаг 1: управляем фото — удаляем старое если товар изменился, показываем новое
     pid_str = product["product_id"]
-    already_shown = _preview_shown.get(chat_id) == pid_str
-    if preview_id and not already_shown:
+    prev = _preview_shown.get(chat_id)  # (product_id, msg_id) или None
+
+    if prev and prev[0] != pid_str:
+        # Другой товар — удаляем старое фото
         try:
-            await bot.send_photo(chat_id=chat_id, photo=preview_id)
-            _preview_shown[chat_id] = pid_str
+            await bot.delete_message(chat_id, prev[1])
+        except Exception:
+            pass
+        _preview_shown.pop(chat_id, None)
+        prev = None
+
+    if preview_id and not prev:
+        # Показываем фото нового товара
+        try:
+            sent_photo = await bot.send_photo(chat_id=chat_id, photo=preview_id)
+            _preview_shown[chat_id] = (pid_str, sent_photo.message_id)
         except Exception as e:
             logger.warning("Не удалось отправить превью: %s", e)
 
@@ -1039,7 +1063,15 @@ async def cb_back_items(call: types.CallbackQuery):
     text = f"📂 <b>{category}</b>\n\nВыберите материал:"
     kb = products_keyboard(products, category_key=category_key)
 
-    # Карточка товара теперь всегда текстовая — просто редактируем на месте
+    # Удаляем фото превью
+    prev = _preview_shown.pop(call.message.chat.id, None)
+    if prev:
+        try:
+            await bot.delete_message(call.message.chat.id, prev[1])
+        except Exception:
+            pass
+
+    # Карточка товара текстовая — редактируем на месте
     try:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
