@@ -103,9 +103,7 @@ _LOCK_TTL = 300  # 5 минут, потом чистим
 # Шаг 3: защита от дублирующих crypto-invoice
 _crypto_invoice_created_at: Dict[str, float] = {}
 
-# Хранит message_id последнего сообщения со списком товаров для каждого чата
-# chat_id -> message_id списка, чтобы удалять старый при возврате "Назад"
-_last_product_list_msg: Dict[int, int] = {}
+
 _CRYPTO_INVOICE_COOLDOWN = 60   # секунд между созданиями invoice для одного товара
 _CRYPTO_INVOICE_MAX_AGE = 3600  # старше 1 часа — чистим из словаря
 
@@ -764,8 +762,7 @@ async def show_categories(message: types.Message):
         reply_markup=categories_keyboard(categories),
         parse_mode="HTML"
     )
-    # Сбрасываем старый список — пришли из текстовой кнопки
-    _last_product_list_msg.pop(message.chat.id, None)
+
 
 
 # =========================
@@ -836,8 +833,7 @@ async def cb_open_catalog(call: types.CallbackQuery):
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
         await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
-    # Сбрасываем запомненный список — мы вернулись в каталог
-    _last_product_list_msg.pop(call.message.chat.id, None)
+
 
 
 @dp.callback_query_handler(lambda c: c.data == "open:purchases")
@@ -883,23 +879,10 @@ async def cb_category(call: types.CallbackQuery):
 
     text = f"📂 <b>{category}</b>\n\nВыберите материал:"
     kb = products_keyboard(products, category_key=key)
-    chat_id = call.message.chat.id
-
-    # Удаляем предыдущий список товаров если он есть
-    old_id = _last_product_list_msg.get(chat_id)
-    if old_id and old_id != call.message.message_id:
-        try:
-            await bot.delete_message(chat_id, old_id)
-        except Exception:
-            pass
-
     try:
-        # Пробуем отредактировать текущее сообщение (каталог)
-        sent = await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-        _last_product_list_msg[chat_id] = sent.message_id if sent else call.message.message_id
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
-        sent = await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
-        _last_product_list_msg[chat_id] = sent.message_id
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await call.answer()
 
 
@@ -1004,9 +987,6 @@ async def cb_item(call: types.CallbackQuery):
 
     await call.answer()
 
-    # Запоминаем id сообщения со списком товаров — чтобы удалить его при возврате "Назад"
-    _last_product_list_msg[call.message.chat.id] = call.message.message_id
-
     text = format_product_card(product)
     kb = product_action_kb(product, category_key=category_key)
     preview_id = _to_str(product.get("preview_file_id"))
@@ -1061,35 +1041,22 @@ async def cb_back_items(call: types.CallbackQuery):
 
     text = f"📂 <b>{category}</b>\n\nВыберите материал:"
     kb = products_keyboard(products, category_key=category_key)
-    chat_id = call.message.chat.id
-
-    # Удаляем предыдущий список товаров если он есть
-    old_list_id = _last_product_list_msg.get(chat_id)
-    if old_list_id and old_list_id != call.message.message_id:
-        try:
-            await bot.delete_message(chat_id, old_list_id)
-        except Exception:
-            pass
 
     try:
         msg = call.message
         if msg.photo:
-            # Карточка с фото — убираем кнопки, шлём список новым сообщением
+            # Карточка с фото — убираем кнопки чтобы она выглядела "закрытой"
             try:
                 await msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup())
             except Exception:
                 pass
-            sent = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+            # Список идёт следующим сообщением
+            await bot.send_message(msg.chat.id, text, reply_markup=kb, parse_mode="HTML")
         else:
-            # Текстовое сообщение — редактируем на месте
-            sent = await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
         logger.exception("edit back_items failed: %s", e)
-        sent = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
-
-    # Запоминаем новый список
-    if sent:
-        _last_product_list_msg[chat_id] = sent.message_id
+        await bot.send_message(call.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
 
     await call.answer()
 
