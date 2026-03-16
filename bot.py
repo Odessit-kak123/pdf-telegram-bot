@@ -1004,6 +1004,9 @@ async def cb_item(call: types.CallbackQuery):
 
     await call.answer()
 
+    # Запоминаем id сообщения со списком товаров — чтобы удалить его при возврате "Назад"
+    _last_product_list_msg[call.message.chat.id] = call.message.message_id
+
     text = format_product_card(product)
     kb = product_action_kb(product, category_key=category_key)
     preview_id = _to_str(product.get("preview_file_id"))
