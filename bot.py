@@ -101,8 +101,11 @@ _purchase_locks_meta: Dict[str, float] = {}
 _LOCK_TTL = 300  # 5 минут, потом чистим
 
 # Шаг 3: защита от дублирующих crypto-invoice
-# Хранит: (user_id, product_id) -> timestamp последнего создания invoice
 _crypto_invoice_created_at: Dict[str, float] = {}
+
+# Хранит message_id последнего сообщения со списком товаров для каждого чата
+# chat_id -> message_id списка, чтобы удалять старый при возврате "Назад"
+_last_product_list_msg: Dict[int, int] = {}
 _CRYPTO_INVOICE_COOLDOWN = 60   # секунд между созданиями invoice для одного товара
 _CRYPTO_INVOICE_MAX_AGE = 3600  # старше 1 часа — чистим из словаря
 
@@ -827,11 +830,12 @@ async def cb_open_catalog(call: types.CallbackQuery):
     categories = sorted(set(_to_str(p.get("category", "")) for p in products if p.get("category")))
     text = "📚 <b>Каталог</b>\n\nВыберите категорию:"
     kb = categories_keyboard(categories)
-    # Одноэкранная навигация: редактируем текущее сообщение
     try:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
         await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    # Сбрасываем запомненный список — мы вернулись в каталог
+    _last_product_list_msg.pop(call.message.chat.id, None)
 
 
 @dp.callback_query_handler(lambda c: c.data == "open:purchases")
@@ -878,9 +882,15 @@ async def cb_category(call: types.CallbackQuery):
     text = f"📂 <b>{category}</b>\n\nВыберите материал:"
     kb = products_keyboard(products, category_key=key)
     try:
-        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        sent = await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        # edit_text возвращает Message — запоминаем id
+        if sent:
+            _last_product_list_msg[call.message.chat.id] = sent.message_id
+        else:
+            _last_product_list_msg[call.message.chat.id] = call.message.message_id
     except Exception:
-        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        sent = await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        _last_product_list_msg[call.message.chat.id] = sent.message_id
     await call.answer()
 
 
@@ -1039,21 +1049,35 @@ async def cb_back_items(call: types.CallbackQuery):
 
     text = f"📂 <b>{category}</b>\n\nВыберите материал:"
     kb = products_keyboard(products, category_key=category_key)
+    chat_id = call.message.chat.id
+
+    # Удаляем предыдущий список товаров если он есть
+    old_list_id = _last_product_list_msg.get(chat_id)
+    if old_list_id and old_list_id != call.message.message_id:
+        try:
+            await bot.delete_message(chat_id, old_list_id)
+        except Exception:
+            pass
 
     try:
         msg = call.message
         if msg.photo:
-            # Фото → убираем кнопки, шлём текст новым сообщением
+            # Карточка с фото — убираем кнопки, шлём список новым сообщением
             try:
                 await msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup())
             except Exception:
                 pass
-            await bot.send_message(call.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
+            sent = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
         else:
-            await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            # Текстовое сообщение — редактируем на месте
+            sent = await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
         logger.exception("edit back_items failed: %s", e)
-        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        sent = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+
+    # Запоминаем новый список
+    if sent:
+        _last_product_list_msg[chat_id] = sent.message_id
 
     await call.answer()
 
