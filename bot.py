@@ -104,8 +104,11 @@ _LOCK_TTL = 300  # 5 минут, потом чистим
 _crypto_invoice_created_at: Dict[str, float] = {}
 
 # Карточка товара: chat_id -> (product_id, photo_message_id)
-# Одно сообщение = фото + caption + кнопки
 _product_card_msg: Dict[int, tuple] = {}  # chat_id -> (product_id, msg_id)
+
+# Все списки товаров в чате: chat_id -> [msg_id, ...]
+# Удаляем ВСЕ накопившиеся списки при возврате "Назад"
+_product_list_msgs: Dict[int, list] = {}  # chat_id -> [msg_id]
 
 
 _CRYPTO_INVOICE_COOLDOWN = 60   # секунд между созданиями invoice для одного товара
@@ -863,6 +866,12 @@ async def cb_open_start(call: types.CallbackQuery):
             await bot.delete_message(call.message.chat.id, prev[1])
         except Exception:
             pass
+    # Чистим стек списков
+    for mid in _product_list_msgs.pop(call.message.chat.id, []):
+        try:
+            await bot.delete_message(call.message.chat.id, mid)
+        except Exception:
+            pass
     try:
         await call.message.edit_text(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
     except Exception:
@@ -1012,6 +1021,12 @@ async def cb_item(call: types.CallbackQuery):
 
     pid_str = product["product_id"]
     prev = _product_card_msg.get(chat_id)  # (product_id, msg_id) или None
+    # Добавляем текущий список в стек для удаления при возврате
+    if chat_id not in _product_list_msgs:
+        _product_list_msgs[chat_id] = []
+    msg_id = call.message.message_id
+    if msg_id not in _product_list_msgs[chat_id]:
+        _product_list_msgs[chat_id].append(msg_id)
 
     if preview_id:
         if prev and prev[0] == pid_str:
@@ -1110,11 +1125,20 @@ async def cb_back_items(call: types.CallbackQuery):
         except Exception:
             pass
 
-    # Возвращаем список в то сообщение откуда нажали (список товаров)
+    # Удаляем ВСЕ накопившиеся списки товаров
+    list_msg_ids = _product_list_msgs.pop(chat_id, [])
+    current_msg_id = call.message.message_id
+    for mid in list_msg_ids:
+        if mid != current_msg_id:
+            try:
+                await bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
+
+    # Текущее сообщение (последний список) превращаем в свежий список
     try:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception as e:
-        logger.exception("edit back_items failed: %s", e)
+    except Exception:
         await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
 
     await call.answer()
