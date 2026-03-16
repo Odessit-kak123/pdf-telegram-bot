@@ -251,14 +251,15 @@ def _db_save_pending_order(
         return False
 
 
-def _db_get_pending_order(payment_method: str, external_invoice_id: str) -> Optional[Dict]:
-    """Возвращает pending order по методу и invoice_id."""
+def _db_get_pending_order(payment_method: str, external_invoice_id: str, user_id: int) -> Optional[Dict]:
+    """Возвращает pending order по методу, invoice_id и user_id."""
     try:
         with _get_db() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
-                "SELECT * FROM pending_orders WHERE payment_method=? AND external_invoice_id=?",
-                (payment_method, str(external_invoice_id))
+                """SELECT * FROM pending_orders
+                   WHERE payment_method=? AND external_invoice_id=? AND user_id=?""",
+                (payment_method, str(external_invoice_id), str(user_id))
             ).fetchone()
         return dict(row) if row else None
     except Exception as e:
@@ -266,16 +267,33 @@ def _db_get_pending_order(payment_method: str, external_invoice_id: str) -> Opti
         return None
 
 
-def _db_delete_pending_order(payment_method: str, external_invoice_id: str) -> None:
+def _db_delete_pending_order(payment_method: str, external_invoice_id: str, user_id: int) -> None:
     try:
         with _get_db() as conn:
             conn.execute(
-                "DELETE FROM pending_orders WHERE payment_method=? AND external_invoice_id=?",
-                (payment_method, str(external_invoice_id))
+                """DELETE FROM pending_orders
+                   WHERE payment_method=? AND external_invoice_id=? AND user_id=?""",
+                (payment_method, str(external_invoice_id), str(user_id))
             )
             conn.commit()
     except Exception as e:
         logger.exception("pending_orders delete error: %s", e)
+
+
+def _db_cleanup_pending_orders() -> None:
+    """Удаляет pending orders старше 7 дней."""
+    try:
+        cutoff = (datetime.now().replace(hour=0, minute=0, second=0)
+                  .__format__("%Y-%m-%d %H:%M:%S"))
+        with _get_db() as conn:
+            cursor = conn.execute(
+                "DELETE FROM pending_orders WHERE created_at < date('now', '-7 days')"
+            )
+            conn.commit()
+            if cursor.rowcount:
+                logger.info("Cleaned %d expired pending orders", cursor.rowcount)
+    except Exception as e:
+        logger.exception("pending_orders cleanup error: %s", e)
 
 
 # =========================
@@ -1293,21 +1311,34 @@ async def cb_pay_stars(call: types.CallbackQuery):
         return
 
     try:
+        # Уникальный ключ оплаты: user_id:product_id:timestamp_ms
+        stars_order_key = f"{user.id}:{pid}:{int(time.time() * 1000)}"
+        payload = f"buystars:{stars_order_key}"
+
+        # Проверяем file_id перед созданием pending
+        if not product.get("file_id"):
+            await call.answer("Файл товара недоступен. Напишите в поддержку.", show_alert=True)
+            return
+
+        # Сначала сохраняем snapshot, потом отправляем invoice
+        loop = asyncio.get_running_loop()
+        saved = await loop.run_in_executor(
+            None, _db_save_pending_order,
+            user.id, product, "stars", str(product["price_xtr"]), "XTR", stars_order_key
+        )
+        if not saved:
+            await call.answer("Не удалось подготовить оплату. Попробуйте ещё раз.", show_alert=True)
+            return
+
         await bot.send_invoice(
             chat_id=call.message.chat.id,
             title=product["title"],
             description=product["description"],
-            payload=f"buystars:{pid}",
+            payload=payload,
             provider_token=PROVIDER_TOKEN,
             currency=CURRENCY,
             prices=[LabeledPrice(label=product["title"], amount=int(product["price_xtr"]))],
             start_parameter=f"buy_stars_{pid}"
-        )
-        # Сохраняем снимок товара — внешний invoice_id для Stars = pid (уникален на пользователя)
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, _db_save_pending_order,
-            user.id, product, "stars", str(product["price_xtr"]), "XTR", pid
         )
         await call.answer()
     except Exception as e:
@@ -1337,6 +1368,11 @@ async def cb_pay_crypto(call: types.CallbackQuery):
         await call.answer("Крипто-оплата пока не настроена.", show_alert=True)
         return
 
+    # Проверяем file_id перед созданием invoice
+    if not product.get("file_id"):
+        await call.answer("Файл товара недоступен. Напишите в поддержку.", show_alert=True)
+        return
+
     # Шаг 3: защита от дублирующих invoice — проверяем cooldown
     dedup_key = f"{user.id}:{pid}"
     last_created = _crypto_invoice_created_at.get(dedup_key, 0)
@@ -1353,12 +1389,15 @@ async def cb_pay_crypto(call: types.CallbackQuery):
         _crypto_invoice_created_at[dedup_key] = time.time()
         _cleanup_invoice_cooldown()
         invoice_id = invoice["invoice_id"]
-        # Сохраняем снимок товара — чтобы выдать файл даже если CSV изменится
+        # Сохраняем снимок СРАЗУ после создания invoice
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
+        saved = await loop.run_in_executor(
             None, _db_save_pending_order,
             user.id, product, "crypto", amount, asset, str(invoice_id)
         )
+        if not saved:
+            logger.error("Не удалось сохранить pending для crypto invoice %s", invoice_id)
+            # Не прерываем — invoice уже создан, пользователь всё равно может оплатить
         pay_url = invoice.get("bot_invoice_url") or invoice.get("pay_url")
 
         if not pay_url:
@@ -1418,7 +1457,7 @@ async def cb_check_crypto(call: types.CallbackQuery):
 
     # Ищем товар: сначала pending_order (снимок), потом CSV
     loop = asyncio.get_running_loop()
-    pending = await loop.run_in_executor(None, _db_get_pending_order, "crypto", str(invoice_id))
+    pending = await loop.run_in_executor(None, _db_get_pending_order, "crypto", str(invoice_id), user.id)
     if pending:
         # Используем снимок товара — не зависим от текущего CSV
         product = {
@@ -1494,7 +1533,9 @@ async def cb_check_crypto(call: types.CallbackQuery):
 
         # Удаляем pending order — оплата завершена
         loop2 = asyncio.get_running_loop()
-        await loop2.run_in_executor(None, _db_delete_pending_order, "crypto", str(invoice_id))
+        await loop2.run_in_executor(
+            None, _db_delete_pending_order, "crypto", str(invoice_id), user.id
+        )
 
         await notify_admin_purchase(
             user=user,
@@ -1554,11 +1595,23 @@ async def successful_payment(message: types.Message):
         await message.answer("Оплата получена, но товар не распознан.")
         return
 
-    pid = payload.split("buystars:", 1)[1].strip()
-    # Ищем товар: сначала pending_order, потом CSV
+    # payload = "buystars:{user_id}:{pid}:{timestamp_ms}"
+    stars_order_key = payload.split("buystars:", 1)[1].strip()
+    # Извлекаем pid из ключа: user_id:pid:timestamp
+    key_parts = stars_order_key.split(":")
+    pid = key_parts[1] if len(key_parts) >= 2 else stars_order_key
+
     loop = asyncio.get_running_loop()
-    pending = await loop.run_in_executor(None, _db_get_pending_order, "stars", pid)
+    pending = await loop.run_in_executor(
+        None, _db_get_pending_order, "stars", stars_order_key, message.from_user.id
+    )
     if pending:
+        # Проверяем консистентность snapshot
+        if pending.get("product_id") != pid:
+            logger.error("Stars pending order mismatch: key=%s pending.product_id=%s pid=%s",
+                         stars_order_key, pending.get("product_id"), pid)
+            await message.answer("Ошибка данных заказа. Напишите в поддержку через /help.")
+            return
         product = {
             "product_id": pending["product_id"],
             "title": pending.get("product_title", ""),
@@ -1566,6 +1619,7 @@ async def successful_payment(message: types.Message):
             "price_xtr": pending.get("expected_amount", "0"),
         }
     else:
+        # Fallback на CSV если pending не найден
         _all_products = await load_products()
         product = next((p for p in _all_products if p["product_id"] == pid), None)
         if not product:
@@ -1599,7 +1653,9 @@ async def successful_payment(message: types.Message):
 
     # Удаляем pending order
     loop2 = asyncio.get_running_loop()
-    await loop2.run_in_executor(None, _db_delete_pending_order, "stars", pid)
+    await loop2.run_in_executor(
+        None, _db_delete_pending_order, "stars", stars_order_key, message.from_user.id
+    )
 
     await notify_admin_purchase(
         user=user,
@@ -1618,8 +1674,11 @@ async def cmd_refresh(message: types.Message):
     global _products_cache, _purchases_sheet_title
     _products_cache = (0.0, [])
     _purchases_sheet_title = None
-    logger.info("Admin triggered cache refresh")
-    await message.answer("✅ Кеш товаров очищен. Следующая загрузка CSV будет с нуля.")
+    # Чистим устаревшие pending orders
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _db_cleanup_pending_orders)
+    logger.info("Admin triggered cache refresh + pending cleanup")
+    await message.answer("✅ Кеш товаров очищен. Старые незавершённые заказы удалены.")
 
 
 @dp.message_handler(content_types=types.ContentType.DOCUMENT, user_id=[ADMIN_CHAT_ID])
@@ -1651,6 +1710,7 @@ WEBAPP_PORT = int(os.getenv("PORT", 8080))
 
 async def on_startup(dp):
     init_db()
+    _db_cleanup_pending_orders()  # Чистим устаревшие pending при каждом старте
     if WEBHOOK_URL:
         await bot.set_webhook(WEBHOOK_URL)
         logger.info("Webhook set: %s", WEBHOOK_URL)
