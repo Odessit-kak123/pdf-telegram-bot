@@ -177,7 +177,7 @@ def _get_db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Создаёт таблицу purchases если её нет. Вызывать при старте."""
+    """Создаёт таблицы если их нет. Вызывать при старте."""
     with _get_db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS purchases (
@@ -193,8 +193,89 @@ def init_db() -> None:
                 UNIQUE(user_id, product_id)
             )
         """)
+        # pending_orders: снимок товара на момент создания invoice
+        # Защищает от ситуации "оплатил — товар убрали из CSV — файл не выдан"
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_orders (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at          TEXT    NOT NULL,
+                user_id             TEXT    NOT NULL,
+                product_id          TEXT    NOT NULL,
+                product_title       TEXT,
+                file_id             TEXT    NOT NULL,
+                payment_method      TEXT    NOT NULL,
+                expected_amount     TEXT,
+                expected_asset      TEXT,
+                external_invoice_id TEXT,
+                UNIQUE(payment_method, external_invoice_id)
+            )
+        """)
         conn.commit()
     logger.info("SQLite DB ready: %s", DB_PATH)
+
+
+# ---- pending_orders CRUD ----
+
+def _db_save_pending_order(
+    user_id: int,
+    product: Dict[str, Any],
+    payment_method: str,
+    expected_amount: Optional[str] = None,
+    expected_asset: Optional[str] = None,
+    external_invoice_id: Optional[str] = None,
+) -> bool:
+    """Сохраняет снимок товара перед оплатой. Возвращает True если сохранено."""
+    try:
+        with _get_db() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO pending_orders
+                   (created_at, user_id, product_id, product_title, file_id,
+                    payment_method, expected_amount, expected_asset, external_invoice_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    str(user_id),
+                    product["product_id"],
+                    product.get("title", ""),
+                    product.get("file_id", ""),
+                    payment_method,
+                    expected_amount,
+                    expected_asset,
+                    external_invoice_id,
+                )
+            )
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.exception("pending_orders insert error: %s", e)
+        return False
+
+
+def _db_get_pending_order(payment_method: str, external_invoice_id: str) -> Optional[Dict]:
+    """Возвращает pending order по методу и invoice_id."""
+    try:
+        with _get_db() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM pending_orders WHERE payment_method=? AND external_invoice_id=?",
+                (payment_method, str(external_invoice_id))
+            ).fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.exception("pending_orders get error: %s", e)
+        return None
+
+
+def _db_delete_pending_order(payment_method: str, external_invoice_id: str) -> None:
+    try:
+        with _get_db() as conn:
+            conn.execute(
+                "DELETE FROM pending_orders WHERE payment_method=? AND external_invoice_id=?",
+                (payment_method, str(external_invoice_id))
+            )
+            conn.commit()
+    except Exception as e:
+        logger.exception("pending_orders delete error: %s", e)
 
 
 # =========================
@@ -404,26 +485,42 @@ def is_free_product(p: Dict[str, Any]) -> bool:
     return (price_xtr == 0 and price_crypto == 0) or (cat == FREE_CATEGORY_NAME)
 
 
+def parse_crypto_amount(product: Dict[str, Any]) -> Optional[Decimal]:
+    """Единая строгая валидация crypto-суммы. None = нельзя продавать за крипту."""
+    raw = _to_str(product.get("price_crypto", ""))
+    if not raw:
+        return None
+    try:
+        amount = Decimal(raw)
+        if amount <= 0:
+            return None
+        return amount
+    except InvalidOperation:
+        logger.warning("Невалидная crypto-сумма для товара %s: %r", product.get("product_id"), raw)
+        return None
+
+
 def can_buy_with_crypto(product: Dict[str, Any]) -> bool:
     if is_free_product(product):
         return False
-    amount = _to_str(product.get("price_crypto", ""))
-    asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET)
-    return bool(CRYPTO_PAY_TOKEN and amount and asset)
+    asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
+    amount = parse_crypto_amount(product)
+    return bool(CRYPTO_PAY_TOKEN and asset and amount is not None)
 
 
 def get_crypto_amount_and_asset(product: Dict[str, Any]) -> Tuple[str, str]:
-    amount = _to_str(product.get("price_crypto", ""))
+    """Возвращает (amount_str, asset) для передачи в Crypto Pay API."""
+    amount = parse_crypto_amount(product)
     asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
 
-    if not amount:
+    if amount is None:
         raise RuntimeError(
-            f"Для товара {product.get('product_id')} не задана колонка price_crypto"
+            f"Для товара {product.get('product_id')} недопустимая price_crypto"
         )
     if not asset:
         asset = CRYPTO_PAY_DEFAULT_ASSET
 
-    return amount, asset
+    return str(amount), asset
 
 
 # =========================
@@ -772,7 +869,7 @@ async def cmd_help(message: types.Message):
     )
 
 
-@dp.message_handler(lambda m: m.text and "Каталог" in m.text)
+@dp.message_handler(lambda m: m.text == "📚 Каталог")
 async def show_categories(message: types.Message):
     products = await load_products()
     if not products:
@@ -875,19 +972,23 @@ async def cb_open_purchases(call: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == "open:start")
 async def cb_open_start(call: types.CallbackQuery):
     await call.answer()
+    chat_id = call.message.chat.id
+    current_msg_id = call.message.message_id
+
     # Удаляем фото-карточку если есть
-    prev = _product_card_msg.pop(call.message.chat.id, None)
+    prev = _product_card_msg.pop(chat_id, None)
     if prev:
         try:
-            await bot.delete_message(call.message.chat.id, prev[1])
+            await bot.delete_message(chat_id, prev[1])
         except Exception:
             pass
-    # Чистим стек списков
-    for mid in _product_list_msgs.pop(call.message.chat.id, []):
-        try:
-            await bot.delete_message(call.message.chat.id, mid)
-        except Exception:
-            pass
+    # Чистим стек списков — но НЕ текущее сообщение (оно нужно для edit_text)
+    for mid in _product_list_msgs.pop(chat_id, []):
+        if mid != current_msg_id:
+            try:
+                await bot.delete_message(chat_id, mid)
+            except Exception:
+                pass
     try:
         await call.message.edit_text(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
     except Exception:
@@ -968,21 +1069,23 @@ def format_product_card(product: Dict[str, Any]) -> str:
     desc = _to_str(product.get("description"), "PDF файл")
 
     price_xtr = int(product.get("price_xtr", 0) or 0)
-    price_crypto_raw = _to_str(product.get("price_crypto", ""))
+    # Используем parse_crypto_amount — единая валидация, та же что и в кнопках
+    crypto_amount = parse_crypto_amount(product)
     crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
     category = _to_str(product.get("category", ""))
 
-    # Цена
+    # Цена: показываем только доступные способы оплаты
     if is_free_product(product):
         price_line = "🎁 <b>Бесплатно</b>"
-    elif price_xtr > 0 and price_crypto_raw:
-        price_line = f"⭐ <b>{price_xtr} Stars</b>  |  💰 <b>{price_crypto_raw} {crypto_asset}</b>"
-    elif price_xtr > 0:
-        price_line = f"⭐ <b>{price_xtr} Stars</b>"
     else:
-        price_line = f"💰 <b>{price_crypto_raw} {crypto_asset}</b>"
+        parts = []
+        if price_xtr > 0:
+            parts.append(f"⭐ <b>{price_xtr} Stars</b>")
+        # Crypto только если реально можно купить (токен есть + сумма валидна)
+        if can_buy_with_crypto(product) and crypto_amount is not None:
+            parts.append(f"💰 <b>{crypto_amount} {crypto_asset}</b>")
+        price_line = "  |  ".join(parts) if parts else "💳 Уточните цену"
 
-    # Категория badge
     cat_line = f"\n<i>📂 {category}</i>" if category else ""
 
     return (
@@ -1200,6 +1303,12 @@ async def cb_pay_stars(call: types.CallbackQuery):
             prices=[LabeledPrice(label=product["title"], amount=int(product["price_xtr"]))],
             start_parameter=f"buy_stars_{pid}"
         )
+        # Сохраняем снимок товара — внешний invoice_id для Stars = pid (уникален на пользователя)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, _db_save_pending_order,
+            user.id, product, "stars", str(product["price_xtr"]), "XTR", pid
+        )
         await call.answer()
     except Exception as e:
         logger.exception("Ошибка send_invoice (Stars): %s", e)
@@ -1242,9 +1351,20 @@ async def cb_pay_crypto(call: types.CallbackQuery):
         amount, asset = get_crypto_amount_and_asset(product)
         invoice = await crypto_create_invoice(product, user)
         _crypto_invoice_created_at[dedup_key] = time.time()
-        _cleanup_invoice_cooldown()  # Чистим устаревшие записи попутно
+        _cleanup_invoice_cooldown()
         invoice_id = invoice["invoice_id"]
+        # Сохраняем снимок товара — чтобы выдать файл даже если CSV изменится
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, _db_save_pending_order,
+            user.id, product, "crypto", amount, asset, str(invoice_id)
+        )
         pay_url = invoice.get("bot_invoice_url") or invoice.get("pay_url")
+
+        if not pay_url:
+            logger.error("Crypto Pay не вернул pay_url для invoice: %s", invoice)
+            await call.answer("Не удалось получить ссылку на оплату. Попробуйте позже.", show_alert=True)
+            return
 
         kb = InlineKeyboardMarkup(row_width=1)
         kb.add(
@@ -1279,21 +1399,43 @@ async def cb_check_crypto(call: types.CallbackQuery):
         await call.answer("Некорректная кнопка.", show_alert=True)
         return
 
-    _all_products = await load_products()
-    product = next((p for p in _all_products if p["product_id"] == pid), None)
-    if not product:
-        await call.answer("Материал не найден.", show_alert=True)
-        return
-
     user = call.from_user
 
     if await user_has_purchase(user.id, pid):
-        await call.answer()
-        await bot.send_document(call.message.chat.id, product["file_id"])
+        # Уже куплено — ищем file_id в покупках или CSV
+        purchase_row = await get_user_purchase_row(user.id, pid)
+        file_id = _to_str(purchase_row.get("file_id")) if purchase_row else ""
+        if not file_id:
+            _all_products = await load_products()
+            prod = next((p for p in _all_products if p["product_id"] == pid), None)
+            file_id = prod["file_id"] if prod else ""
+        if file_id:
+            await call.answer()
+            await bot.send_document(call.message.chat.id, file_id)
+        else:
+            await call.answer("Не удалось найти файл. Напишите в поддержку.", show_alert=True)
         return
 
+    # Ищем товар: сначала pending_order (снимок), потом CSV
+    loop = asyncio.get_running_loop()
+    pending = await loop.run_in_executor(None, _db_get_pending_order, "crypto", str(invoice_id))
+    if pending:
+        # Используем снимок товара — не зависим от текущего CSV
+        product = {
+            "product_id": pending["product_id"],
+            "title": pending.get("product_title", ""),
+            "file_id": pending["file_id"],
+            "price_crypto": pending.get("expected_amount", ""),
+            "crypto_asset": pending.get("expected_asset", ""),
+        }
+    else:
+        _all_products = await load_products()
+        product = next((p for p in _all_products if p["product_id"] == pid), None)
+        if not product:
+            await call.answer("Материал не найден. Напишите в поддержку.", show_alert=True)
+            return
+
     try:
-        # FIX #1 применён внутри crypto_get_invoice — передаём список
         invoice = await crypto_get_invoice(invoice_id)
         if not invoice:
             await call.answer("Счёт не найден.", show_alert=True)
@@ -1349,6 +1491,10 @@ async def cb_check_crypto(call: types.CallbackQuery):
         if not ok:
             await call.answer("Оплата есть, но не удалось сохранить покупку. Напишите в поддержку.", show_alert=True)
             return
+
+        # Удаляем pending order — оплата завершена
+        loop2 = asyncio.get_running_loop()
+        await loop2.run_in_executor(None, _db_delete_pending_order, "crypto", str(invoice_id))
 
         await notify_admin_purchase(
             user=user,
@@ -1409,11 +1555,22 @@ async def successful_payment(message: types.Message):
         return
 
     pid = payload.split("buystars:", 1)[1].strip()
-    _all_products = await load_products()
-    product = next((p for p in _all_products if p["product_id"] == pid), None)
-    if not product:
-        await message.answer("Оплата получена, но материал сейчас недоступен.")
-        return
+    # Ищем товар: сначала pending_order, потом CSV
+    loop = asyncio.get_running_loop()
+    pending = await loop.run_in_executor(None, _db_get_pending_order, "stars", pid)
+    if pending:
+        product = {
+            "product_id": pending["product_id"],
+            "title": pending.get("product_title", ""),
+            "file_id": pending["file_id"],
+            "price_xtr": pending.get("expected_amount", "0"),
+        }
+    else:
+        _all_products = await load_products()
+        product = next((p for p in _all_products if p["product_id"] == pid), None)
+        if not product:
+            await message.answer("Оплата получена, но материал сейчас недоступен. Напишите в поддержку через /help.")
+            return
 
     # FIX #3: для XTR (Stars) total_amount = кол-во звёзд напрямую.
     # В таблице price_xtr должно быть целое число звёзд (например: 100).
@@ -1439,6 +1596,10 @@ async def successful_payment(message: types.Message):
     if not ok:
         await message.answer("Оплата получена, но не удалось сохранить покупку. Напишите в поддержку.")
         return
+
+    # Удаляем pending order
+    loop2 = asyncio.get_running_loop()
+    await loop2.run_in_executor(None, _db_delete_pending_order, "stars", pid)
 
     await notify_admin_purchase(
         user=user,
