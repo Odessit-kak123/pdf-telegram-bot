@@ -15,7 +15,6 @@ from decimal import Decimal, InvalidOperation
 import requests
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import (
-    ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
     LabeledPrice
 )
@@ -67,8 +66,7 @@ FREE_CATEGORY_NAME = "🎁 Бесплатные материалы"
 HTTP_TIMEOUT = 15
 
 # Кеши
-PRODUCTS_CACHE_TTL = 60
-PURCHASES_CACHE_TTL = 60
+PRODUCTS_CACHE_TTL = 60  # секунд — TTL кеша каталога товаров
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN")
@@ -130,17 +128,17 @@ def _get_purchase_lock(user_id: int, product_id: str) -> asyncio.Lock:
     key = f"{user_id}:{product_id}"
     now = time.time()
 
-    # Чистим старые локи, но ТОЛЬКО если они уже не заняты
-    expired = [
-        k for k, ts in _purchase_locks_meta.items()
-        if now - ts > _LOCK_TTL and not _purchase_locks.get(k, None) or
-           (k in _purchase_locks and not _purchase_locks[k].locked() and now - ts > _LOCK_TTL)
-    ]
-    for k in expired:
+    # Чистим старые локи — только незанятые и с истёкшим TTL
+    expired = []
+    for k, ts in _purchase_locks_meta.items():
+        is_old = (now - ts) > _LOCK_TTL
         lock_obj = _purchase_locks.get(k)
-        if lock_obj is None or not lock_obj.locked():
-            _purchase_locks.pop(k, None)
-            _purchase_locks_meta.pop(k, None)
+        is_free = (lock_obj is None) or (not lock_obj.locked())
+        if is_old and is_free:
+            expired.append(k)
+    for k in expired:
+        _purchase_locks.pop(k, None)
+        _purchase_locks_meta.pop(k, None)
 
     if key not in _purchase_locks:
         _purchase_locks[key] = asyncio.Lock()
@@ -151,16 +149,6 @@ def _get_purchase_lock(user_id: int, product_id: str) -> asyncio.Lock:
 # =========================
 # UI: МЕНЮ / КНОПКИ
 # =========================
-
-def main_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        keyboard=[
-            [KeyboardButton("📚 Каталог")],
-            [KeyboardButton("📂 Мои покупки")],
-        ]
-    )
-
 
 def help_inline_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
@@ -950,45 +938,27 @@ def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeybo
 
     pid = product["product_id"]
     price_xtr = int(product.get("price_xtr", 0) or 0)
-    price_crypto_raw = str(product.get("price_crypto", "")).strip()
-    crypto_asset = str(product.get("crypto_asset", "")).strip().upper()
+    price_crypto_raw = _to_str(product.get("price_crypto", ""))
+    crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
 
-    if price_xtr > 0:
-        kb.add(
-            InlineKeyboardButton(
+    if is_free_product(product):
+        # Бесплатный — только одна кнопка скачать
+        kb.add(InlineKeyboardButton("🎁 Скачать бесплатно", callback_data=f"get:{pid}"))
+    else:
+        if price_xtr > 0:
+            kb.add(InlineKeyboardButton(
                 f"⭐ Купить за {price_xtr} Stars",
                 callback_data=f"paystars:{pid}"
-            )
-        )
-
-    if price_crypto_raw and crypto_asset:
-        kb.add(
-            InlineKeyboardButton(
+            ))
+        # Crypto только если реально настроен — через can_buy_with_crypto()
+        if can_buy_with_crypto(product):
+            kb.add(InlineKeyboardButton(
                 f"💰 Купить за {price_crypto_raw} {crypto_asset}",
                 callback_data=f"paycrypto:{pid}"
-            )
-        )
+            ))
 
-    if price_xtr == 0 and not price_crypto_raw:
-        kb.add(
-            InlineKeyboardButton(
-                "🎁 Скачать бесплатно",
-                callback_data=f"get:{pid}"
-            )
-        )
-
-    kb.add(
-        InlineKeyboardButton(
-            "⬅️ Назад к списку",
-            callback_data=f"back_items:{category_key}"
-        )
-    )
-    kb.add(
-        InlineKeyboardButton(
-            "🏠 Главная",
-            callback_data="open:start"
-        )
-    )
+    kb.add(InlineKeyboardButton("⬅️ Назад к списку", callback_data=f"back_items:{category_key}"))
+    kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
 
     return kb
 
@@ -1357,6 +1327,11 @@ async def cb_check_crypto(call: types.CallbackQuery):
                     return
             except InvalidOperation:
                 logger.warning("Не удалось сравнить суммы: %s vs %s", invoice_amount, amount)
+                await call.answer(
+                    "Не удалось проверить сумму оплаты. Напишите в поддержку через /help.",
+                    show_alert=True
+                )
+                return
         if invoice_asset and invoice_asset != asset:
             logger.warning(
                 "Invoice asset mismatch: expected=%s got=%s user=%s product=%s",
