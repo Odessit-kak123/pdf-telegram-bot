@@ -103,9 +103,9 @@ _LOCK_TTL = 300  # 5 минут, потом чистим
 # Шаг 3: защита от дублирующих crypto-invoice
 _crypto_invoice_created_at: Dict[str, float] = {}
 
-# Превью товаров: chat_id -> (product_id, photo_message_id)
-# Храним message_id фото чтобы удалять его при переходе на другой товар
-_preview_shown: Dict[int, tuple] = {}  # chat_id -> (product_id, msg_id)
+# Карточка товара: chat_id -> (product_id, photo_message_id)
+# Одно сообщение = фото + caption + кнопки
+_product_card_msg: Dict[int, tuple] = {}  # chat_id -> (product_id, msg_id)
 
 
 _CRYPTO_INVOICE_COOLDOWN = 60   # секунд между созданиями invoice для одного товара
@@ -826,8 +826,8 @@ async def send_my_purchases(chat_id: int, user: types.User):
 @dp.callback_query_handler(lambda c: c.data == "open:catalog")
 async def cb_open_catalog(call: types.CallbackQuery):
     await call.answer()
-    # Удаляем фото превью если есть
-    prev = _preview_shown.pop(call.message.chat.id, None)
+    # Удаляем фото-карточку если есть
+    prev = _product_card_msg.pop(call.message.chat.id, None)
     if prev:
         try:
             await bot.delete_message(call.message.chat.id, prev[1])
@@ -856,8 +856,8 @@ async def cb_open_purchases(call: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == "open:start")
 async def cb_open_start(call: types.CallbackQuery):
     await call.answer()
-    # Удаляем фото превью если есть
-    prev = _preview_shown.pop(call.message.chat.id, None)
+    # Удаляем фото-карточку если есть
+    prev = _product_card_msg.pop(call.message.chat.id, None)
     if prev:
         try:
             await bot.delete_message(call.message.chat.id, prev[1])
@@ -1010,32 +1010,69 @@ async def cb_item(call: types.CallbackQuery):
     preview_id = _to_str(product.get("preview_file_id"))
     chat_id = call.message.chat.id
 
-    # Шаг 1: управляем фото — удаляем старое если товар изменился, показываем новое
     pid_str = product["product_id"]
-    prev = _preview_shown.get(chat_id)  # (product_id, msg_id) или None
+    prev = _product_card_msg.get(chat_id)  # (product_id, msg_id) или None
 
-    if prev and prev[0] != pid_str:
-        # Другой товар — удаляем старое фото
+    if preview_id:
+        if prev and prev[0] == pid_str:
+            # Тот же товар — просто обновляем кнопки (caption уже правильный)
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id, message_id=prev[1], reply_markup=kb
+                )
+                # Редактируем список (то сообщение откуда нажали) убирая кнопки
+                try:
+                    await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup())
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        elif prev and prev[0] != pid_str:
+            # Другой товар — меняем фото и caption через edit_media
+            try:
+                from aiogram.types import InputMediaPhoto
+                await bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=prev[1],
+                    media=InputMediaPhoto(media=preview_id, caption=text, parse_mode="HTML"),
+                    reply_markup=kb
+                )
+                _product_card_msg[chat_id] = (pid_str, prev[1])
+                # Убираем кнопки со списка товаров
+                try:
+                    await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup())
+                except Exception:
+                    pass
+            except Exception:
+                # Если edit_media не сработал — удаляем старое, шлём новое
+                try:
+                    await bot.delete_message(chat_id, prev[1])
+                except Exception:
+                    pass
+                _product_card_msg.pop(chat_id, None)
+                sent = await bot.send_photo(
+                    chat_id=chat_id, photo=preview_id,
+                    caption=text, reply_markup=kb, parse_mode="HTML"
+                )
+                _product_card_msg[chat_id] = (pid_str, sent.message_id)
+        else:
+            # Первый раз — отправляем новое фото-сообщение
+            sent = await bot.send_photo(
+                chat_id=chat_id, photo=preview_id,
+                caption=text, reply_markup=kb, parse_mode="HTML"
+            )
+            _product_card_msg[chat_id] = (pid_str, sent.message_id)
+            # Убираем кнопки со списка товаров
+            try:
+                await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup())
+            except Exception:
+                pass
+    else:
+        # Нет превью — текстовая карточка
         try:
-            await bot.delete_message(chat_id, prev[1])
+            await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
         except Exception:
-            pass
-        _preview_shown.pop(chat_id, None)
-        prev = None
-
-    if preview_id and not prev:
-        # Показываем фото нового товара
-        try:
-            sent_photo = await bot.send_photo(chat_id=chat_id, photo=preview_id)
-            _preview_shown[chat_id] = (pid_str, sent_photo.message_id)
-        except Exception as e:
-            logger.warning("Не удалось отправить превью: %s", e)
-
-    # Шаг 2: карточка с описанием и кнопками — текстовое, редактируется при "Назад"
-    try:
-        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except Exception:
-        await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+            await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("back_items:"))
@@ -1063,20 +1100,22 @@ async def cb_back_items(call: types.CallbackQuery):
     text = f"📂 <b>{category}</b>\n\nВыберите материал:"
     kb = products_keyboard(products, category_key=category_key)
 
-    # Удаляем фото превью
-    prev = _preview_shown.pop(call.message.chat.id, None)
+    chat_id = call.message.chat.id
+
+    # Удаляем фото-карточку товара
+    prev = _product_card_msg.pop(chat_id, None)
     if prev:
         try:
-            await bot.delete_message(call.message.chat.id, prev[1])
+            await bot.delete_message(chat_id, prev[1])
         except Exception:
             pass
 
-    # Карточка товара текстовая — редактируем на месте
+    # Возвращаем список в то сообщение откуда нажали (список товаров)
     try:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
         logger.exception("edit back_items failed: %s", e)
-        await bot.send_message(call.message.chat.id, text, reply_markup=kb, parse_mode="HTML")
+        await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
 
     await call.answer()
 
