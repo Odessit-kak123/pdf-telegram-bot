@@ -915,27 +915,8 @@ def categories_keyboard(categories: List[str]) -> InlineKeyboardMarkup:
 
 
 def _product_btn_label(p: Dict[str, Any]) -> str:
-    """
-    Формирует текст кнопки товара в списке.
-    Цена — в скобках справа, эмодзи — только один (из названия или ценовой).
-    Если название уже начинается с эмодзи — не добавляем второй.
-    """
-    title = p["title"]
-    price_xtr = int(p.get("price_xtr", 0) or 0)
-    crypto_amount = parse_crypto_amount(p)
-
-    if is_free_product(p):
-        price_tag = "бесплатно"
-    elif price_xtr > 0 and crypto_amount is not None:
-        price_tag = f"{price_xtr} ⭐ / {crypto_amount} {_to_str(p.get('crypto_asset', 'USDT')).upper()}"
-    elif price_xtr > 0:
-        price_tag = f"{price_xtr} ⭐"
-    elif crypto_amount is not None:
-        price_tag = f"{crypto_amount} {_to_str(p.get('crypto_asset', 'USDT')).upper()}"
-    else:
-        price_tag = "уточните цену"
-
-    return f"{title}  ({price_tag})"
+    """Текст кнопки товара в списке — только название."""
+    return p["title"]
 
 
 def products_keyboard(products: List[Dict[str, Any]], category_key: str) -> InlineKeyboardMarkup:
