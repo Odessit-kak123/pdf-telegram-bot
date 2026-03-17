@@ -83,6 +83,8 @@ if not _GOOGLE_LIBS_AVAILABLE:
 logger.info("CRYPTO PAY TOKEN LOADED: %s", bool(CRYPTO_PAY_TOKEN))
 logger.info("CRYPTO PAY BASE URL: %s", CRYPTO_PAY_BASE_URL)
 logger.info("CRYPTO PAY DEFAULT ASSET: %s", CRYPTO_PAY_DEFAULT_ASSET)
+logger.info("CARD NUMBER SET: %s", bool(CARD_NUMBER))
+logger.info("CARD PRICE RUB: %s", CARD_PRICE_RUB or "not set")
 
 bot = Bot(token=BOT_TOKEN.strip())
 dp = Dispatcher(bot, storage=MemoryStorage())
@@ -2263,6 +2265,35 @@ async def successful_payment(message: types.Message):
 # =========================
 # ADMIN: refresh + debug
 # =========================
+
+@dp.message_handler(commands=["cardtest"], user_id=ADMIN_IDS)
+async def cmd_cardtest(message: types.Message):
+    """Диагностика: проверяет загружены ли переменные карты."""
+    card_num_masked = (
+        CARD_NUMBER[:4] + " **** **** " + CARD_NUMBER[-4:]
+        if len(CARD_NUMBER) >= 8 else ("задан" if CARD_NUMBER else "НЕ ЗАДАН")
+    )
+    lines = [
+        "🔍 <b>Диагностика оплаты картой</b>\n",
+        f"CARD_NUMBER: <b>{card_num_masked}</b>",
+        f"CARD_PRICE_RUB: <b>{CARD_PRICE_RUB or 'не задан (берётся из товара)'}</b>",
+    ]
+    # Проверяем тестовый товар
+    all_products = await load_products()
+    paid = [p for p in all_products if not is_free_product(p)]
+    if paid:
+        test_p = paid[0]
+        has_card = _has_card_payment(test_p)
+        has_multi = _has_multiple_pay_methods(test_p)
+        count = _count_pay_methods(test_p)
+        lines.append("\nТест на товаре «" + test_p["title"] + "»:")
+        lines.append(f"  price_rub = {test_p.get('price_rub', 0)}")
+        lines.append(f"  _has_card_payment = {has_card}")
+        lines.append(f"  _count_pay_methods = {count}")
+        lines.append(f"  _has_multiple = {has_multi}")
+        lines.append(f"  → {'кнопка Купить' if has_multi else 'прямая кнопка'}")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
 
 @dp.message_handler(commands=["refresh"], user_id=ADMIN_IDS)
 async def cmd_refresh(message: types.Message):
