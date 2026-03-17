@@ -29,7 +29,6 @@ try:
     _GOOGLE_LIBS_AVAILABLE = True
 except ImportError:
     _GOOGLE_LIBS_AVAILABLE = False
-    # logger ещё не создан на этом этапе — предупреждение выведем позже
 
 
 # =========================
@@ -38,39 +37,28 @@ except ImportError:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# Таблица ТОВАРОВ (публичная, CSV):
 PRODUCTS_CSV_URL = "https://docs.google.com/spreadsheets/d/1V1LCKR13JNply4LAEfJBtYNAE854Zr8aBBMTUTC2kPA/gviz/tq?tqx=out:csv"
 
-# SQLite база покупок (хранится на Railway Volume или рядом с bot.py)
 DB_PATH = os.getenv("DB_PATH", "purchases.db").strip()
 
-# Google Sheets — только для резервного зеркалирования покупок (необязательно)
-# Если GOOGLE_SERVICE_ACCOUNT_JSON не задан, зеркалирование просто отключается.
 PURCHASES_SHEET_ID = os.getenv("PURCHASES_SHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
-# Админы (список ID)
 ADMIN_IDS = [8491241832, 627225180, 481246770]
-ADMIN_CHAT_ID = 8491241832  # главный админ — получает уведомления о покупках
-AUTHOR_USERNAME = "art_kids_support"  # без @
+ADMIN_CHAT_ID = 8491241832
+AUTHOR_USERNAME = "art_kids_support"
 
-# Telegram Stars
 CURRENCY = "XTR"
-PROVIDER_TOKEN = ""  # для Stars пусто
+PROVIDER_TOKEN = ""
 
-# Crypto Pay
 CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN", "").strip()
 CRYPTO_PAY_BASE_URL = os.getenv("CRYPTO_PAY_BASE_URL", "https://pay.crypt.bot/api").strip()
 CRYPTO_PAY_DEFAULT_ASSET = os.getenv("CRYPTO_PAY_DEFAULT_ASSET", "USDT").strip().upper()
 
-# Бесплатная категория (точно как в таблице!)
 FREE_CATEGORY_NAME = "🎁 Бесплатные материалы"
 
-# Таймауты
 HTTP_TIMEOUT = 15
-
-# Кеши
-PRODUCTS_CACHE_TTL = 60  # секунд — TTL кеша каталога товаров
+PRODUCTS_CACHE_TTL = 60
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задан BOT_TOKEN")
@@ -96,30 +84,27 @@ dp = Dispatcher(bot, storage=MemoryStorage())
 
 # =========================
 # БЛОКИРОВКИ ПРОТИВ ДВОЙНЫХ ПОКУПОК
-# FIX #2: asyncio.Lock на каждую пару user_id:product_id
 # =========================
 
 _purchase_locks: Dict[str, asyncio.Lock] = {}
 _purchase_locks_meta: Dict[str, float] = {}
-_LOCK_TTL = 300  # 5 минут, потом чистим
+_LOCK_TTL = 300
 
-# Шаг 3: защита от дублирующих crypto-invoice
+# FIX: отдельный лок для cooldown crypto invoice
+_crypto_cooldown_lock = asyncio.Lock()
 _crypto_invoice_created_at: Dict[str, float] = {}
 
+_CRYPTO_INVOICE_COOLDOWN = 60
+_CRYPTO_INVOICE_MAX_AGE = 3600
+
 # Карточка товара: chat_id -> (product_id, photo_message_id)
-_product_card_msg: Dict[int, tuple] = {}  # chat_id -> (product_id, msg_id)
+_product_card_msg: Dict[int, tuple] = {}
 
 # Все списки товаров в чате: chat_id -> [msg_id, ...]
-# Удаляем ВСЕ накопившиеся списки при возврате "Назад"
-_product_list_msgs: Dict[int, list] = {}  # chat_id -> [msg_id]
-
-
-_CRYPTO_INVOICE_COOLDOWN = 60   # секунд между созданиями invoice для одного товара
-_CRYPTO_INVOICE_MAX_AGE = 3600  # старше 1 часа — чистим из словаря
+_product_list_msgs: Dict[int, list] = {}
 
 
 def _cleanup_invoice_cooldown() -> None:
-    """Удаляет устаревшие записи cooldown. Вызывать изредка."""
     cutoff = time.time() - _CRYPTO_INVOICE_MAX_AGE
     expired = [k for k, ts in _crypto_invoice_created_at.items() if ts < cutoff]
     for k in expired:
@@ -131,8 +116,6 @@ def _cleanup_invoice_cooldown() -> None:
 def _get_purchase_lock(user_id: int, product_id: str) -> asyncio.Lock:
     key = f"{user_id}:{product_id}"
     now = time.time()
-
-    # Чистим старые локи — только незанятые и с истёкшим TTL
     expired = []
     for k, ts in _purchase_locks_meta.items():
         is_old = (now - ts) > _LOCK_TTL
@@ -143,7 +126,6 @@ def _get_purchase_lock(user_id: int, product_id: str) -> asyncio.Lock:
     for k in expired:
         _purchase_locks.pop(k, None)
         _purchase_locks_meta.pop(k, None)
-
     if key not in _purchase_locks:
         _purchase_locks[key] = asyncio.Lock()
     _purchase_locks_meta[key] = now
@@ -166,22 +148,18 @@ def help_inline_kb() -> InlineKeyboardMarkup:
 
 
 # =========================
-# SQLite: БАЗА ПОКУПОК
-# Заменяет Google Sheets как основное хранилище.
-# Google Sheets опционально используется для зеркала/отчётности.
+# SQLite: БАЗА
 # =========================
 
 def _get_db() -> sqlite3.Connection:
-    """Открывает соединение с SQLite с нужными настройками."""
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL;")   # WAL — безопасно при конкурентных записях
-    conn.execute("PRAGMA busy_timeout=5000;")  # 5 сек ожидания если БД занята
-    conn.execute("PRAGMA synchronous=NORMAL;") # Баланс скорость/надёжность
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
 
 def init_db() -> None:
-    """Создаёт таблицы если их нет. Вызывать при старте."""
     with _get_db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS purchases (
@@ -197,8 +175,6 @@ def init_db() -> None:
                 UNIQUE(user_id, product_id)
             )
         """)
-        # pending_orders: снимок товара на момент создания invoice
-        # Защищает от ситуации "оплатил — товар убрали из CSV — файл не выдан"
         conn.execute("""
             CREATE TABLE IF NOT EXISTS pending_orders (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -211,10 +187,9 @@ def init_db() -> None:
                 expected_amount     TEXT,
                 expected_asset      TEXT,
                 external_invoice_id TEXT,
-                UNIQUE(payment_method, external_invoice_id)
+                UNIQUE(payment_method, external_invoice_id, user_id)
             )
         """)
-        # favourites: избранное пользователей
         conn.execute("""
             CREATE TABLE IF NOT EXISTS favourites (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -224,7 +199,6 @@ def init_db() -> None:
                 UNIQUE(user_id, product_id)
             )
         """)
-        # reviews: отзывы на товары
         conn.execute("""
             CREATE TABLE IF NOT EXISTS reviews (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -239,7 +213,6 @@ def init_db() -> None:
                 UNIQUE(user_id, product_id)
             )
         """)
-        # review_requests: когда отправить запрос отзыва
         conn.execute("""
             CREATE TABLE IF NOT EXISTS review_requests (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,14 +223,12 @@ def init_db() -> None:
                 UNIQUE(user_id, product_id)
             )
         """)
-        # bot_settings: настройки бота (gif, etc.)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             )
         """)
-        # quiz_results: результаты квиза для рекомендаций
         conn.execute("""
             CREATE TABLE IF NOT EXISTS quiz_results (
                 user_id    TEXT PRIMARY KEY,
@@ -266,7 +237,6 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             )
         """)
-        # products: основное хранилище товаров (вместо Google Sheets CSV)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -361,7 +331,6 @@ def _db_set_product_active(product_id: str, active: bool) -> bool:
 
 
 def _db_import_from_csv_if_empty(products_from_csv: List[Dict[str, Any]]) -> int:
-    """Импортирует товары из CSV в SQLite если таблица пустая. Возвращает кол-во импортированных."""
     with _get_db() as conn:
         count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
     if count > 0:
@@ -376,19 +345,16 @@ def _db_import_from_csv_if_empty(products_from_csv: List[Dict[str, Any]]) -> int
 
 
 def _db_get_stats() -> Dict[str, Any]:
-    """Статистика для админки."""
     with _get_db() as conn:
         total_purchases = conn.execute("SELECT COUNT(*) FROM purchases").fetchone()[0]
         unique_buyers = conn.execute("SELECT COUNT(DISTINCT user_id) FROM purchases").fetchone()[0]
         products_active = conn.execute("SELECT COUNT(*) FROM products WHERE active=1").fetchone()[0]
         products_total = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
-        # Топ-5 товаров
         top = conn.execute(
             """SELECT product_title, COUNT(*) as cnt
                FROM purchases GROUP BY product_id
                ORDER BY cnt DESC LIMIT 5"""
         ).fetchall()
-        # Продажи за сегодня
         today = conn.execute(
             "SELECT COUNT(*) FROM purchases WHERE date >= date('now')"
         ).fetchone()[0]
@@ -412,6 +378,7 @@ def _db_get_setting(key: str, default: str = "") -> str:
     except Exception:
         return default
 
+
 def _db_set_setting(key: str, value: str) -> None:
     try:
         with _get_db() as conn:
@@ -424,7 +391,6 @@ def _db_set_setting(key: str, value: str) -> None:
 # ---- favourites CRUD ----
 
 def _db_toggle_favourite(user_id: int, product_id: str) -> bool:
-    """Добавляет или убирает из избранного. Возвращает True если добавлено."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _get_db() as conn:
         row = conn.execute(
@@ -442,6 +408,7 @@ def _db_toggle_favourite(user_id: int, product_id: str) -> bool:
             conn.commit()
             return True
 
+
 def _db_is_favourite(user_id: int, product_id: str) -> bool:
     with _get_db() as conn:
         row = conn.execute(
@@ -450,8 +417,8 @@ def _db_is_favourite(user_id: int, product_id: str) -> bool:
         ).fetchone()
     return row is not None
 
+
 def _db_get_favourites(user_id: int) -> List[str]:
-    """Возвращает список product_id из избранного пользователя."""
     with _get_db() as conn:
         rows = conn.execute(
             "SELECT product_id FROM favourites WHERE user_id=? ORDER BY added_at DESC",
@@ -480,6 +447,7 @@ def _db_add_review(user: "types.User", product_id: str, product_title: str,
         logger.exception("review add error: %s", e)
         return False
 
+
 def _db_get_reviews(product_id: str) -> List[Dict]:
     with _get_db() as conn:
         conn.row_factory = sqlite3.Row
@@ -488,6 +456,7 @@ def _db_get_reviews(product_id: str) -> List[Dict]:
             (product_id,)
         ).fetchall()
     return [dict(r) for r in rows]
+
 
 def _db_delete_review(review_id: int) -> bool:
     try:
@@ -498,6 +467,7 @@ def _db_delete_review(review_id: int) -> bool:
     except Exception:
         return False
 
+
 def _db_has_review(user_id: int, product_id: str) -> bool:
     with _get_db() as conn:
         row = conn.execute(
@@ -507,10 +477,16 @@ def _db_has_review(user_id: int, product_id: str) -> bool:
     return row is not None
 
 
+def _db_get_review_by_id(review_id: int) -> Optional[Dict]:
+    with _get_db() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
+    return dict(row) if row else None
+
+
 # ---- review_requests CRUD ----
 
 def _db_schedule_review_request(user_id: int, product_id: str) -> None:
-    """Планирует запрос отзыва через 24 часа."""
     from datetime import timedelta
     send_after = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -524,8 +500,8 @@ def _db_schedule_review_request(user_id: int, product_id: str) -> None:
     except Exception as e:
         logger.exception("schedule_review_request error: %s", e)
 
+
 def _db_get_pending_review_requests() -> List[Dict]:
-    """Возвращает запросы отзывов которые пора отправить."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _get_db() as conn:
         conn.row_factory = sqlite3.Row
@@ -535,6 +511,7 @@ def _db_get_pending_review_requests() -> List[Dict]:
             (now,)
         ).fetchall()
     return [dict(r) for r in rows]
+
 
 def _db_mark_review_request_sent(request_id: int) -> None:
     with _get_db() as conn:
@@ -553,6 +530,7 @@ def _db_save_quiz(user_id: int, age_group: str, interest: str) -> None:
             (str(user_id), age_group, interest, now)
         )
         conn.commit()
+
 
 def _db_get_quiz(user_id: int) -> Optional[Dict]:
     with _get_db() as conn:
@@ -573,7 +551,6 @@ def _db_save_pending_order(
     expected_asset: Optional[str] = None,
     external_invoice_id: Optional[str] = None,
 ) -> bool:
-    """Сохраняет снимок товара перед оплатой. Возвращает True если сохранено."""
     try:
         with _get_db() as conn:
             cursor = conn.execute(
@@ -601,7 +578,6 @@ def _db_save_pending_order(
 
 
 def _db_get_pending_order(payment_method: str, external_invoice_id: str, user_id: int) -> Optional[Dict]:
-    """Возвращает pending order по методу, invoice_id и user_id."""
     try:
         with _get_db() as conn:
             conn.row_factory = sqlite3.Row
@@ -630,7 +606,6 @@ def _db_delete_pending_order(payment_method: str, external_invoice_id: str, user
 
 
 def _db_cleanup_pending_orders() -> None:
-    """Удаляет pending orders старше 7 дней."""
     try:
         with _get_db() as conn:
             cursor = conn.execute(
@@ -665,7 +640,6 @@ def _build_sheets_service():
 
 
 async def _mirror_to_sheets(row: list) -> None:
-    """Зеркалирование покупки в Google Sheets. Молча игнорирует ошибки."""
     if not GOOGLE_SERVICE_ACCOUNT_JSON or not PURCHASES_SHEET_ID:
         return
     try:
@@ -704,11 +678,11 @@ async def _mirror_to_sheets(row: list) -> None:
 
 
 # =========================
-# ТОВАРЫ (CSV)
+# ТОВАРЫ (CSV → SQLite)
 # =========================
 
 _products_cache: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
-_csv_imported: bool = False  # Флаг: CSV уже был импортирован в SQLite
+_csv_imported: bool = False
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -731,39 +705,7 @@ def _to_bool(value: Any) -> bool:
     return str(value).strip().lower() in ("true", "1", "yes", "y", "да")
 
 
-def _to_float_safe(value: Any, default: float = 0.0) -> float:
-    """
-    Безопасное преобразование в float.
-    Корректно обрабатывает строки вида "1.5 USDT" — извлекает число из начала.
-    Мусор типа "abc", "бесплатно" возвращает default и логирует warning.
-    """
-    if value is None:
-        return default
-    s = str(value).strip()
-    if s == "":
-        return default
-    # Сначала пробуем простой float
-    try:
-        return float(s)
-    except (ValueError, TypeError):
-        pass
-    # Пробуем вытащить первое число из строки: "1.5 USDT" -> 1.5
-    m = re.match(r"^\s*([0-9]+(?:[.,][0-9]+)?)", s)
-    if m:
-        num_str = m.group(1).replace(",", ".")
-        try:
-            result = float(num_str)
-            logger.debug("_to_float_safe: извлёк %.4f из %r", result, s)
-            return result
-        except ValueError:
-            pass
-    # Настоящий мусор — логируем и возвращаем default (НЕ считаем платным автоматически)
-    logger.warning("_to_float_safe: не удалось разобрать %r, возвращаю default=%.1f", s, default)
-    return default
-
-
 def _sync_fetch_csv() -> str:
-    """Синхронная загрузка CSV товаров — для первичной миграции."""
     r = requests.get(PRODUCTS_CSV_URL, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     r.encoding = "utf-8"
@@ -771,7 +713,6 @@ def _sync_fetch_csv() -> str:
 
 
 def _parse_csv_products(csv_text: str) -> List[Dict[str, Any]]:
-    """Разбирает CSV и возвращает список товаров."""
     products = []
     reader = csv.DictReader(io.StringIO(csv_text))
     for row in reader:
@@ -802,10 +743,6 @@ def _parse_csv_products(csv_text: str) -> List[Dict[str, Any]]:
 
 
 async def load_products() -> List[Dict[str, Any]]:
-    """
-    Основной источник товаров: SQLite.
-    При первом запуске импортирует из CSV если таблица пустая.
-    """
     global _products_cache, _csv_imported
     ts, cached = _products_cache
     if cached and (time.time() - ts) < PRODUCTS_CACHE_TTL:
@@ -813,7 +750,6 @@ async def load_products() -> List[Dict[str, Any]]:
 
     loop = asyncio.get_running_loop()
 
-    # Миграция: один раз при старте импортируем CSV в SQLite
     if not _csv_imported:
         try:
             csv_text = await loop.run_in_executor(None, _sync_fetch_csv)
@@ -824,7 +760,6 @@ async def load_products() -> List[Dict[str, Any]]:
             logger.warning("CSV миграция не удалась (не критично): %s", e)
         _csv_imported = True
 
-    # Основная загрузка из SQLite
     try:
         rows = await loop.run_in_executor(None, _db_get_all_products, True)
         products = []
@@ -851,46 +786,30 @@ async def load_products() -> List[Dict[str, Any]]:
 
 
 def is_free_product(p: Dict[str, Any]) -> bool:
-    """
-    Бесплатность определяется ТОЛЬКО ценами, не категорией.
-    Категория — для навигации, цена — для монетизации.
-    """
     price_xtr = int(p.get("price_xtr", 0) or 0)
-    crypto_amount = parse_crypto_amount(p)  # None или Decimal > 0
+    crypto_amount = parse_crypto_amount(p)
     return price_xtr == 0 and crypto_amount is None
 
 
-# Разрешённый формат price_crypto: целое или десятичное с точкой, например "1", "1.5", "10.99"
 _CRYPTO_AMOUNT_RE = re.compile(r"^\d+(\.\d+)?$")
 
 
 def parse_crypto_amount(product: Dict[str, Any]) -> Optional[Decimal]:
-    """
-    Единая строгая валидация crypto-суммы.
-    Разрешает только формат: целое или десятичное с точкой ("1", "1.5", "10.99").
-    Отвергает: "1E-3", "1,5", "0", "-1", "1 USDT", "abc".
-    Возвращает None если сумма невалидна или нулевая.
-    """
     raw = _to_str(product.get("price_crypto", ""))
     if not raw:
         return None
-    # Строгий формат: только цифры и опциональная точка
     if not _CRYPTO_AMOUNT_RE.match(raw):
         logger.warning(
-            "Невалидный формат price_crypto для товара %s: %r (ожидается '1' или '1.50')",
+            "Невалидный формат price_crypto для товара %s: %r",
             product.get("product_id"), raw
         )
         return None
     try:
         amount = Decimal(raw)
         if amount <= 0:
-            logger.warning("Нулевая/отрицательная crypto-сумма для товара %s: %r",
-                           product.get("product_id"), raw)
             return None
         return amount
     except InvalidOperation:
-        logger.warning("Невалидная crypto-сумма для товара %s: %r",
-                       product.get("product_id"), raw)
         return None
 
 
@@ -903,23 +822,19 @@ def can_buy_with_crypto(product: Dict[str, Any]) -> bool:
 
 
 def get_crypto_amount_and_asset(product: Dict[str, Any]) -> Tuple[str, str]:
-    """Возвращает (amount_str, asset) для передачи в Crypto Pay API."""
     amount = parse_crypto_amount(product)
     asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
-
     if amount is None:
         raise RuntimeError(
             f"Для товара {product.get('product_id')} недопустимая price_crypto"
         )
     if not asset:
         asset = CRYPTO_PAY_DEFAULT_ASSET
-
     return str(amount), asset
 
 
 # =========================
 # SAFE callback_data для категорий
-# FIX #4: не делаем clear() — только обновляем ключи
 # =========================
 
 _cat_key_to_name: Dict[str, str] = {}
@@ -927,6 +842,12 @@ _cat_key_to_name: Dict[str, str] = {}
 
 def _cat_key(name: str) -> str:
     return hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+
+
+def _register_categories(categories: List[str]) -> None:
+    for c in categories:
+        c_clean = _to_str(c)
+        _cat_key_to_name[_cat_key(c_clean)] = c_clean
 
 
 def categories_keyboard(categories: List[str]) -> InlineKeyboardMarkup:
@@ -995,13 +916,6 @@ def _db_get_purchase(user_id: int, product_id: str) -> Optional[Dict[str, str]]:
 
 
 def _db_insert_purchase(user: "types.User", product: Dict[str, Any], price_label: str) -> str:
-    """
-    Вставляет покупку в БД.
-    Возвращает:
-      "inserted" — новая запись создана
-      "exists"   — запись уже была (дубль), это нормально
-      "error"    — реальная ошибка БД, файл выдавать нельзя
-    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     username = f"@{user.username}" if user.username else ""
     try:
@@ -1039,11 +953,6 @@ async def get_user_purchase_row(user_id: int, product_id: str) -> Optional[Dict[
 
 
 async def append_purchase_row(user: types.User, product: Dict[str, Any], price_label: str) -> bool:
-    """
-    Записывает покупку в SQLite.
-    Возвращает True если можно выдавать файл (inserted или exists).
-    Возвращает False только при реальной ошибке БД.
-    """
     loop = asyncio.get_running_loop()
     status = await loop.run_in_executor(None, _db_insert_purchase, user, product, price_label)
 
@@ -1052,10 +961,9 @@ async def append_purchase_row(user: types.User, product: Dict[str, Any], price_l
             "DB insert failed for user=%s product=%s — файл НЕ выдаём",
             user.id, product.get("product_id")
         )
-        return False  # Реальная ошибка — не выдаём файл
+        return False
 
     if status == "inserted":
-        # Новая покупка — зеркалируем в Sheets
         mirror_row = [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             str(user.id),
@@ -1066,10 +974,17 @@ async def append_purchase_row(user: types.User, product: Dict[str, Any], price_l
             str(price_label),
             product.get("file_id", ""),
         ]
-        asyncio.create_task(_mirror_to_sheets(mirror_row))
+        asyncio.create_task(_safe_mirror_to_sheets(mirror_row))
 
-    # "inserted" или "exists" — в обоих случаях выдаём файл
     return True
+
+
+async def _safe_mirror_to_sheets(row: list) -> None:
+    """Обёртка с обработкой исключений для фоновой задачи."""
+    try:
+        await _mirror_to_sheets(row)
+    except Exception as e:
+        logger.warning("_safe_mirror_to_sheets error: %s", e)
 
 
 # =========================
@@ -1083,7 +998,6 @@ def crypto_headers() -> Dict[str, str]:
 
 
 def _sync_crypto_create_invoice(data: dict) -> Dict[str, Any]:
-    """Синхронный HTTP-запрос к Crypto Pay — вызывать через run_in_executor."""
     r = requests.post(
         f"{CRYPTO_PAY_BASE_URL}/createInvoice",
         json=data,
@@ -1098,7 +1012,6 @@ def _sync_crypto_create_invoice(data: dict) -> Dict[str, Any]:
 
 
 def _sync_crypto_get_invoice(invoice_id: int) -> Optional[Dict[str, Any]]:
-    """Синхронный HTTP-запрос к Crypto Pay — вызывать через run_in_executor."""
     r = requests.post(
         f"{CRYPTO_PAY_BASE_URL}/getInvoices",
         json={"invoice_ids": [invoice_id]},
@@ -1114,10 +1027,8 @@ def _sync_crypto_get_invoice(invoice_id: int) -> Optional[Dict[str, Any]]:
 
 
 async def crypto_create_invoice(product: Dict[str, Any], user: types.User) -> Dict[str, Any]:
-    """Асинхронное создание invoice — не блокирует event loop."""
     amount, asset = get_crypto_amount_and_asset(product)
     payload = f"crypto:{user.id}:{product['product_id']}"
-
     data = {
         "asset": asset,
         "amount": amount,
@@ -1127,20 +1038,17 @@ async def crypto_create_invoice(product: Dict[str, Any], user: types.User) -> Di
         "allow_comments": False,
         "allow_anonymous": True
     }
-
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _sync_crypto_create_invoice, data)
 
 
 async def crypto_get_invoice(invoice_id: int) -> Optional[Dict[str, Any]]:
-    """Асинхронная проверка invoice — не блокирует event loop."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _sync_crypto_get_invoice, invoice_id)
 
 
 # =========================
 # ОБЩАЯ ВЫДАЧА ТОВАРА
-# FIX #2: asyncio.Lock против двойных покупок
 # =========================
 
 async def grant_product_to_user(
@@ -1153,7 +1061,6 @@ async def grant_product_to_user(
     lock = _get_purchase_lock(user.id, pid)
 
     async with lock:
-        # Проверяем ВНУТРИ лока — защита от двойной записи
         if await user_has_purchase(user.id, pid):
             await bot.send_document(chat_id, product["file_id"])
             return True
@@ -1163,7 +1070,7 @@ async def grant_product_to_user(
             return False
 
         await bot.send_document(chat_id, product["file_id"])
-        asyncio.create_task(_suggest_more(chat_id, user.id, product))
+        asyncio.create_task(_safe_suggest_more(chat_id, user.id, product))
         loop2 = asyncio.get_running_loop()
         await loop2.run_in_executor(None, _db_schedule_review_request, user.id, product["product_id"])
         return True
@@ -1182,17 +1089,14 @@ async def notify_admin_purchase(
             f"📄 <b>Товар:</b> {product['title']}\n"
             f"💳 <b>Оплата:</b> {payment_text}\n"
         )
-
         if invoice_id is not None:
             admin_text += f"🧾 <b>Invoice ID:</b> <code>{invoice_id}</code>\n"
-
         admin_text += (
             f"\n👤 <b>Покупатель:</b>\n"
             f"ID: <code>{user.id}</code>\n"
             f"Имя: {user.full_name}\n"
             f"Username: {username}"
         )
-
         await bot.send_message(ADMIN_CHAT_ID, admin_text, parse_mode="HTML")
     except Exception as e:
         logger.exception("Не удалось уведомить админа: %s", e)
@@ -1200,7 +1104,6 @@ async def notify_admin_purchase(
 
 # =========================
 # START / HELP
-# FIX #8: /start с deep link обрабатывается корректно
 # =========================
 
 START_TEXT = (
@@ -1215,7 +1118,6 @@ START_TEXT = (
 
 
 def start_inline_kb() -> InlineKeyboardMarkup:
-    """Красивое inline-меню вместо ReplyKeyboard на старте."""
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("📚 Каталог", callback_data="open:catalog"),
@@ -1233,7 +1135,6 @@ def start_inline_kb() -> InlineKeyboardMarkup:
 
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    # FIX #8: обрабатываем deep link вида /start buy_stars_p001
     args = message.get_args()
     if args and args.startswith("buy_stars_"):
         pid = args.replace("buy_stars_", "", 1).strip()
@@ -1241,7 +1142,7 @@ async def cmd_start(message: types.Message):
         product = next((p for p in _all_products if p["product_id"] == pid), None)
         if product:
             await message.answer(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
-            text = await format_product_card_full(product)
+            text = await _format_product_card_full(product)
             kb = product_action_kb(product, category_key=_cat_key(_to_str(product.get("category", ""))))
             preview_id = _to_str(product.get("preview_file_id"))
             if preview_id:
@@ -1270,32 +1171,15 @@ async def cmd_help(message: types.Message):
     )
 
 
-@dp.message_handler(lambda m: m.text == "📚 Каталог")
-async def show_categories(message: types.Message):
-    products = await load_products()
-    if not products:
-        await message.answer("Пока нет доступных материалов.")
-        return
-
-    categories = sorted(set(_to_str(p.get("category", "")) for p in products if p.get("category")))
-    await message.answer(
-        "📚 <b>Каталог</b>\n\nВыберите категорию:",
-        reply_markup=categories_keyboard(categories),
-        parse_mode="HTML"
-    )
-
-
-
 # =========================
 # МОИ ПОКУПКИ
 # =========================
 
-@dp.message_handler(lambda m: m.text == "📂 Мои покупки")
-async def show_my_purchases(message: types.Message):
-    await send_my_purchases(message.chat.id, message.from_user)
-
-
 async def send_my_purchases(chat_id: int, user: types.User):
+    """
+    FIX: Покупки показываются редактированием существующего сообщения,
+    а не отправкой новых. Список товаров — в одном сообщении.
+    """
     loop = asyncio.get_running_loop()
     user_rows = await loop.run_in_executor(None, _db_get_user_purchases, user.id)
 
@@ -1322,34 +1206,109 @@ async def send_my_purchases(chat_id: int, user: types.User):
             seen.add(pid)
             unique_rows.append(r)
 
-    await bot.send_message(chat_id, "📂 Ваши покупки:")
+    # Строим ONE сообщение со всем списком + inline кнопками
+    lines = ["📂 <b>Ваши покупки:</b>\n"]
+    kb = InlineKeyboardMarkup(row_width=1)
 
     for r in unique_rows:
         pid = _to_str(r.get("product_id"))
         title = _to_str(r.get("product_title")) or prod_map.get(pid, {}).get("title", "PDF")
-
         price_from_row = _to_str(r.get("price_label") or r.get("price_xtr"))
         is_free_row = (price_from_row == "" or price_from_row == "0")
-
         emoji = "🎁" if is_free_row else "⭐"
-        meta = "🎁 Бесплатно" if is_free_row else f"💳 {price_from_row}"
+        lines.append(f"{emoji} {title}")
+        kb.add(InlineKeyboardButton(f"📥 Скачать: {title[:30]}", callback_data=f"dl:{pid}"))
 
-        kb = InlineKeyboardMarkup().add(
-            InlineKeyboardButton(f"{emoji} Скачать", callback_data=f"dl:{pid}")
-        )
-        await bot.send_message(chat_id, f"📄 {title}\n{meta}", reply_markup=kb)
+    kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
 
+    await bot.send_message(
+        chat_id,
+        "\n".join(lines),
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+# =========================
+# ИЗБРАННОЕ — без засорения чата
+# =========================
+
+async def send_favourites(chat_id: int, user: types.User, edit_message: Optional[types.Message] = None):
+    """
+    FIX: Избранное показывается как одно сообщение со списком,
+    вместо кучи отдельных сообщений.
+    """
+    loop = asyncio.get_running_loop()
+    fav_ids = await loop.run_in_executor(None, _db_get_favourites, user.id)
+
+    if not fav_ids:
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("📚 Каталог", callback_data="open:catalog"))
+        kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
+        text = "🤍 <b>Избранное пусто</b>\n\nДобавляй товары кнопкой ❤️ на карточке"
+        if edit_message:
+            try:
+                await edit_message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+                return
+            except Exception:
+                pass
+        await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    all_products = await load_products()
+    prod_map = {p["product_id"]: p for p in all_products}
+
+    lines = ["❤️ <b>Избранное:</b>\n"]
+    kb = InlineKeyboardMarkup(row_width=1)
+
+    for pid in fav_ids:
+        product = prod_map.get(pid)
+        if not product:
+            continue
+        is_bought = await user_has_purchase(user.id, pid)
+        price_xtr = int(product.get("price_xtr", 0) or 0)
+        if is_bought:
+            status = "✅"
+        elif is_free_product(product):
+            status = "🎁"
+        else:
+            status = f"⭐{price_xtr}"
+
+        lines.append(f"{status} {product['title']}")
+        cat_key = _cat_key(_to_str(product.get("category", "")))
+        _cat_key_to_name[cat_key] = _to_str(product.get("category", ""))
+
+        if is_bought:
+            kb.add(InlineKeyboardButton(
+                f"📥 {product['title'][:28]}",
+                callback_data=f"dl:{pid}"
+            ))
+        else:
+            kb.add(InlineKeyboardButton(
+                f"👁 {product['title'][:28]}",
+                callback_data=f"item:{pid}:{cat_key}"
+            ))
+
+    kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
+
+    text = "\n".join(lines)
+    if edit_message:
+        try:
+            await edit_message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+
+
+# =========================
+# CALLBACKS: open:catalog / open:purchases / open:start / open:favourites
+# =========================
 
 @dp.callback_query_handler(lambda c: c.data == "open:catalog")
 async def cb_open_catalog(call: types.CallbackQuery):
     await call.answer()
-    # Удаляем фото-карточку если есть
-    prev = _product_card_msg.pop(call.message.chat.id, None)
-    if prev:
-        try:
-            await bot.delete_message(call.message.chat.id, prev[1])
-        except Exception:
-            pass
+    _cleanup_product_card(call.message.chat.id)
     products = await load_products()
     if not products:
         await call.message.answer("Пока нет доступных материалов.")
@@ -1363,7 +1322,6 @@ async def cb_open_catalog(call: types.CallbackQuery):
         await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
-
 @dp.callback_query_handler(lambda c: c.data == "open:purchases")
 async def cb_open_purchases(call: types.CallbackQuery):
     await call.answer()
@@ -1374,26 +1332,31 @@ async def cb_open_purchases(call: types.CallbackQuery):
 async def cb_open_start(call: types.CallbackQuery):
     await call.answer()
     chat_id = call.message.chat.id
-    current_msg_id = call.message.message_id
-
-    # Удаляем фото-карточку если есть
-    prev = _product_card_msg.pop(chat_id, None)
-    if prev:
-        try:
-            await bot.delete_message(chat_id, prev[1])
-        except Exception:
-            pass
-    # Чистим стек списков — но НЕ текущее сообщение (оно нужно для edit_text)
-    for mid in _product_list_msgs.pop(chat_id, []):
-        if mid != current_msg_id:
-            try:
-                await bot.delete_message(chat_id, mid)
-            except Exception:
-                pass
+    _cleanup_product_card(chat_id)
     try:
         await call.message.edit_text(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
     except Exception:
         await call.message.answer(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
+
+
+@dp.callback_query_handler(lambda c: c.data == "open:favourites")
+async def cb_open_favourites(call: types.CallbackQuery):
+    await call.answer()
+    await send_favourites(call.message.chat.id, call.from_user, edit_message=call.message)
+
+
+def _cleanup_product_card(chat_id: int) -> None:
+    """Удаляет закреплённую фото-карточку товара если есть."""
+    prev = _product_card_msg.pop(chat_id, None)
+    if prev:
+        asyncio.create_task(_safe_delete_message(chat_id, prev[1]))
+
+
+async def _safe_delete_message(chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
 
 
 # =========================
@@ -1408,8 +1371,7 @@ async def cb_category(call: types.CallbackQuery):
     if not category:
         products_all = await load_products()
         cats = sorted(set(_to_str(p.get("category", "")) for p in products_all if p.get("category")))
-        for c in cats:
-            _cat_key_to_name[_cat_key(c)] = c
+        _register_categories(cats)
         category = _cat_key_to_name.get(key)
 
     if not category:
@@ -1432,19 +1394,17 @@ async def cb_category(call: types.CallbackQuery):
 
 
 # =========================
-# ПРЕДПРОСМОТР ТОВАРА + ЛОКАЛЬНАЯ КНОПКА "НАЗАД"
+# ПРЕДПРОСМОТР ТОВАРА
 # =========================
 
 def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
-
     pid = product["product_id"]
     price_xtr = int(product.get("price_xtr", 0) or 0)
     price_crypto_raw = _to_str(product.get("price_crypto", ""))
     crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
 
     if is_free_product(product):
-        # Бесплатный — только одна кнопка скачать
         kb.add(InlineKeyboardButton("🎁 Скачать бесплатно", callback_data=f"get:{pid}"))
     else:
         if price_xtr > 0:
@@ -1452,7 +1412,6 @@ def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeybo
                 f"⭐ Купить за {price_xtr} Stars",
                 callback_data=f"paystars:{pid}"
             ))
-        # Crypto только если реально настроен — через can_buy_with_crypto()
         if can_buy_with_crypto(product):
             kb.add(InlineKeyboardButton(
                 f"💰 Купить за {price_crypto_raw} {crypto_asset}",
@@ -1462,28 +1421,23 @@ def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeybo
     kb.add(InlineKeyboardButton("❤️ В избранное", callback_data=f"fav:toggle:{pid}:{category_key}"))
     kb.add(InlineKeyboardButton("⬅️ Назад к списку", callback_data=f"back_items:{category_key}"))
     kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
-
     return kb
 
 
-def format_product_card(product: Dict[str, Any]) -> str:
+def _format_product_card(product: Dict[str, Any]) -> str:
     title = product.get("title", "PDF")
     desc = _to_str(product.get("description"), "PDF файл")
-
     price_xtr = int(product.get("price_xtr", 0) or 0)
-    # Используем parse_crypto_amount — единая валидация, та же что и в кнопках
     crypto_amount = parse_crypto_amount(product)
     crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
     category = _to_str(product.get("category", ""))
 
-    # Цена: показываем только доступные способы оплаты
     if is_free_product(product):
         price_line = "🎁 <b>Бесплатно</b>"
     else:
         parts = []
         if price_xtr > 0:
             parts.append(f"⭐ <b>{price_xtr} Stars</b>")
-        # Crypto только если реально можно купить (токен есть + сумма валидна)
         if can_buy_with_crypto(product) and crypto_amount is not None:
             parts.append(f"💰 <b>{crypto_amount} {crypto_asset}</b>")
         price_line = "  |  ".join(parts) if parts else "💳 Уточните цену"
@@ -1499,10 +1453,10 @@ def format_product_card(product: Dict[str, Any]) -> str:
     )
 
 
-async def format_product_card_full(product: Dict[str, Any]) -> str:
-    """Карточка товара с отзывами."""
-    base = format_product_card(product)
-    reviews_text = await get_reviews_text(product["product_id"])
+async def _format_product_card_full(product: Dict[str, Any]) -> str:
+    """FIX: Единственное определение — дублирование устранено."""
+    base = _format_product_card(product)
+    reviews_text = await _get_reviews_text(product["product_id"])
     return base + reviews_text if reviews_text else base
 
 
@@ -1524,20 +1478,14 @@ async def cb_item(call: types.CallbackQuery):
 
     await call.answer()
 
-    text = await format_product_card_full(product)
-    # Добавляем кнопку отзывов в клавиатуру если есть отзывы
-    loop2 = asyncio.get_running_loop()
-    reviews = await loop2.run_in_executor(None, _db_get_reviews, product["product_id"])
+    text = await _format_product_card_full(product)
     kb = product_action_kb(product, category_key=category_key)
-    if reviews:
-        # Добавляем кнопки удаления отзывов для автора/админа
-        pass
     preview_id = _to_str(product.get("preview_file_id"))
     chat_id = call.message.chat.id
-
     pid_str = product["product_id"]
-    prev = _product_card_msg.get(chat_id)  # (product_id, msg_id) или None
-    # Добавляем текущий список в стек для удаления при возврате
+    prev = _product_card_msg.get(chat_id)
+
+    # Запоминаем текущий список для последующего удаления
     if chat_id not in _product_list_msgs:
         _product_list_msgs[chat_id] = []
     msg_id = call.message.message_id
@@ -1546,12 +1494,11 @@ async def cb_item(call: types.CallbackQuery):
 
     if preview_id:
         if prev and prev[0] == pid_str:
-            # Тот же товар — просто обновляем кнопки (caption уже правильный)
+            # Тот же товар — обновляем только кнопки
             try:
                 await bot.edit_message_reply_markup(
                     chat_id=chat_id, message_id=prev[1], reply_markup=kb
                 )
-                # Редактируем список (то сообщение откуда нажали) убирая кнопки
                 try:
                     await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup())
                 except Exception:
@@ -1559,7 +1506,7 @@ async def cb_item(call: types.CallbackQuery):
             except Exception:
                 pass
         elif prev and prev[0] != pid_str:
-            # Другой товар — меняем фото и caption через edit_media
+            # Другой товар — меняем фото
             try:
                 from aiogram.types import InputMediaPhoto
                 await bot.edit_message_media(
@@ -1569,13 +1516,11 @@ async def cb_item(call: types.CallbackQuery):
                     reply_markup=kb
                 )
                 _product_card_msg[chat_id] = (pid_str, prev[1])
-                # Убираем кнопки со списка товаров
                 try:
                     await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup())
                 except Exception:
                     pass
             except Exception:
-                # Если edit_media не сработал — удаляем старое, шлём новое
                 try:
                     await bot.delete_message(chat_id, prev[1])
                 except Exception:
@@ -1587,19 +1532,17 @@ async def cb_item(call: types.CallbackQuery):
                 )
                 _product_card_msg[chat_id] = (pid_str, sent.message_id)
         else:
-            # Первый раз — отправляем новое фото-сообщение
+            # Первый раз
             sent = await bot.send_photo(
                 chat_id=chat_id, photo=preview_id,
                 caption=text, reply_markup=kb, parse_mode="HTML"
             )
             _product_card_msg[chat_id] = (pid_str, sent.message_id)
-            # Убираем кнопки со списка товаров
             try:
                 await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup())
             except Exception:
                 pass
     else:
-        # Нет превью — текстовая карточка
         try:
             await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
         except Exception:
@@ -1614,8 +1557,7 @@ async def cb_back_items(call: types.CallbackQuery):
     if not category:
         products_all = await load_products()
         cats = sorted(set(_to_str(p.get("category", "")) for p in products_all if p.get("category")))
-        for c in cats:
-            _cat_key_to_name[_cat_key(c)] = c
+        _register_categories(cats)
         category = _cat_key_to_name.get(category_key)
 
     if not category:
@@ -1630,28 +1572,20 @@ async def cb_back_items(call: types.CallbackQuery):
 
     text = f"📂 <b>{category}</b>\n\nВыберите материал:"
     kb = products_keyboard(products, category_key=category_key)
-
     chat_id = call.message.chat.id
 
-    # Удаляем фото-карточку товара
+    # Удаляем фото-карточку
     prev = _product_card_msg.pop(chat_id, None)
     if prev:
-        try:
-            await bot.delete_message(chat_id, prev[1])
-        except Exception:
-            pass
+        asyncio.create_task(_safe_delete_message(chat_id, prev[1]))
 
-    # Удаляем ВСЕ накопившиеся списки товаров
-    list_msg_ids = _product_list_msgs.pop(chat_id, [])
+    # Удаляем накопившиеся списки товаров
     current_msg_id = call.message.message_id
+    list_msg_ids = _product_list_msgs.pop(chat_id, [])
     for mid in list_msg_ids:
         if mid != current_msg_id:
-            try:
-                await bot.delete_message(chat_id, mid)
-            except Exception:
-                pass
+            asyncio.create_task(_safe_delete_message(chat_id, mid))
 
-    # Текущее сообщение (последний список) превращаем в свежий список
     try:
         await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
@@ -1707,17 +1641,16 @@ async def cb_pay_stars(call: types.CallbackQuery):
         await bot.send_document(call.message.chat.id, product["file_id"])
         return
 
+    stars_order_key = None
     try:
-        # Уникальный ключ оплаты: user_id:product_id:timestamp_ms
-        stars_order_key = f"{user.id}:{pid}:{int(time.time() * 1000)}"
-        payload = f"buystars:{stars_order_key}"
+        # FIX: используем только user_id + timestamp, без pid — избегаем проблем с ":" в product_id
+        stars_order_key = f"{user.id}:{int(time.time() * 1000)}"
+        payload = f"buystars:{stars_order_key}:{pid}"
 
-        # Проверяем file_id перед созданием pending
         if not product.get("file_id"):
             await call.answer("Файл товара недоступен. Напишите в поддержку.", show_alert=True)
             return
 
-        # Сначала сохраняем snapshot, потом отправляем invoice
         loop = asyncio.get_running_loop()
         saved = await loop.run_in_executor(
             None, _db_save_pending_order,
@@ -1740,14 +1673,14 @@ async def cb_pay_stars(call: types.CallbackQuery):
         await call.answer()
     except Exception as e:
         logger.exception("Ошибка send_invoice (Stars): %s", e)
-        # Удаляем pending — invoice не создан, snapshot не нужен
-        try:
-            loop_exc = asyncio.get_running_loop()
-            await loop_exc.run_in_executor(
-                None, _db_delete_pending_order, "stars", stars_order_key, user.id
-            )
-        except Exception:
-            pass
+        if stars_order_key:
+            try:
+                loop_exc = asyncio.get_running_loop()
+                await loop_exc.run_in_executor(
+                    None, _db_delete_pending_order, "stars", stars_order_key, user.id
+                )
+            except Exception:
+                pass
         await call.answer("Не удалось создать счёт Stars. Проверь настройки бота.", show_alert=True)
 
 
@@ -1773,28 +1706,29 @@ async def cb_pay_crypto(call: types.CallbackQuery):
         await call.answer("Крипто-оплата пока не настроена.", show_alert=True)
         return
 
-    # Проверяем file_id перед созданием invoice
     if not product.get("file_id"):
         await call.answer("Файл товара недоступен. Напишите в поддержку.", show_alert=True)
         return
 
-    # Шаг 3: защита от дублирующих invoice — проверяем cooldown
+    # FIX: атомарная проверка cooldown через asyncio.Lock
     dedup_key = f"{user.id}:{pid}"
-    last_created = _crypto_invoice_created_at.get(dedup_key, 0)
-    if time.time() - last_created < _CRYPTO_INVOICE_COOLDOWN:
-        await call.answer(
-            "Счёт уже был создан недавно. Подождите минуту или нажмите «Я оплатил, проверить» выше.",
-            show_alert=True
-        )
-        return
+    async with _crypto_cooldown_lock:
+        last_created = _crypto_invoice_created_at.get(dedup_key, 0)
+        if time.time() - last_created < _CRYPTO_INVOICE_COOLDOWN:
+            await call.answer(
+                "Счёт уже был создан недавно. Подождите минуту или нажмите «Я оплатил, проверить» выше.",
+                show_alert=True
+            )
+            return
+        # Помечаем сразу — внутри лока
+        _crypto_invoice_created_at[dedup_key] = time.time()
 
     try:
         amount, asset = get_crypto_amount_and_asset(product)
         invoice = await crypto_create_invoice(product, user)
-        _crypto_invoice_created_at[dedup_key] = time.time()
         _cleanup_invoice_cooldown()
         invoice_id = invoice["invoice_id"]
-        # Сохраняем снимок СРАЗУ после создания invoice
+
         loop = asyncio.get_running_loop()
         saved = await loop.run_in_executor(
             None, _db_save_pending_order,
@@ -1802,22 +1736,21 @@ async def cb_pay_crypto(call: types.CallbackQuery):
         )
         if not saved:
             logger.error("Не удалось сохранить pending для crypto invoice %s", invoice_id)
-            # Invoice создан, но snapshot не сохранён — сообщаем пользователю
-            # Кнопка оплаты не показывается чтобы не создавать сирот
-            await call.answer(
-                "Не удалось подготовить заказ. Попробуйте ещё раз.",
-                show_alert=True
-            )
+            # Сбрасываем cooldown — invoice не будет доступен пользователю
+            async with _crypto_cooldown_lock:
+                _crypto_invoice_created_at.pop(dedup_key, None)
+            await call.answer("Не удалось подготовить заказ. Попробуйте ещё раз.", show_alert=True)
             return
-        pay_url = invoice.get("bot_invoice_url") or invoice.get("pay_url")
 
+        pay_url = invoice.get("bot_invoice_url") or invoice.get("pay_url")
         if not pay_url:
             logger.error("Crypto Pay не вернул pay_url для invoice: %s", invoice)
-            # Удаляем pending — без ссылки пользователь не может оплатить
             loop_pu = asyncio.get_running_loop()
             await loop_pu.run_in_executor(
                 None, _db_delete_pending_order, "crypto", str(invoice_id), user.id
             )
+            async with _crypto_cooldown_lock:
+                _crypto_invoice_created_at.pop(dedup_key, None)
             await call.answer("Не удалось получить ссылку на оплату. Попробуйте позже.", show_alert=True)
             return
 
@@ -1842,14 +1775,18 @@ async def cb_pay_crypto(call: types.CallbackQuery):
 
     except Exception as e:
         logger.exception("Ошибка создания crypto invoice: %s", e)
+        # Сбрасываем cooldown при ошибке
+        async with _crypto_cooldown_lock:
+            _crypto_invoice_created_at.pop(dedup_key, None)
         await call.answer("Не удалось создать crypto-счёт.", show_alert=True)
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("checkcrypto:"))
 async def cb_check_crypto(call: types.CallbackQuery):
     try:
-        _, pid, invoice_id_raw = call.data.split(":", 2)
-        invoice_id = int(invoice_id_raw)
+        parts = call.data.split(":", 2)
+        pid = parts[1]
+        invoice_id = int(parts[2])
     except Exception:
         await call.answer("Некорректная кнопка.", show_alert=True)
         return
@@ -1857,7 +1794,6 @@ async def cb_check_crypto(call: types.CallbackQuery):
     user = call.from_user
 
     if await user_has_purchase(user.id, pid):
-        # Уже куплено — ищем file_id в покупках или CSV
         purchase_row = await get_user_purchase_row(user.id, pid)
         file_id = _to_str(purchase_row.get("file_id")) if purchase_row else ""
         if not file_id:
@@ -1871,11 +1807,9 @@ async def cb_check_crypto(call: types.CallbackQuery):
             await call.answer("Не удалось найти файл. Напишите в поддержку.", show_alert=True)
         return
 
-    # Ищем товар: сначала pending_order (снимок), потом CSV
     loop = asyncio.get_running_loop()
     pending = await loop.run_in_executor(None, _db_get_pending_order, "crypto", str(invoice_id), user.id)
     if pending:
-        # Используем снимок товара — не зависим от текущего CSV
         product = {
             "product_id": pending["product_id"],
             "title": pending.get("product_title", ""),
@@ -1884,12 +1818,10 @@ async def cb_check_crypto(call: types.CallbackQuery):
             "crypto_asset": pending.get("expected_asset", ""),
         }
     else:
-        # Аномалия: pending не найден при проверке crypto invoice
         logger.warning(
             "Crypto cb_check_crypto без pending: user=%s pid=%s invoice_id=%s",
             user.id, pid, invoice_id
         )
-        # Fallback на CSV
         _all_products = await load_products()
         product = next((p for p in _all_products if p["product_id"] == pid), None)
         if not product:
@@ -1904,8 +1836,8 @@ async def cb_check_crypto(call: types.CallbackQuery):
 
         status = _to_str(invoice.get("status", ""))
         payload = _to_str(invoice.get("payload", ""))
-
         expected_payload = f"crypto:{user.id}:{pid}"
+
         if payload != expected_payload:
             await call.answer("Этот счёт не принадлежит этому товару.", show_alert=True)
             return
@@ -1916,7 +1848,6 @@ async def cb_check_crypto(call: types.CallbackQuery):
 
         amount, asset = get_crypto_amount_and_asset(product)
 
-        # Проверяем сумму через Decimal — "1.5" и "1.50" считаются равными
         invoice_amount = _to_str(invoice.get("amount", ""))
         invoice_asset = _to_str(invoice.get("asset", "")).upper()
         if invoice_amount:
@@ -1929,17 +1860,9 @@ async def cb_check_crypto(call: types.CallbackQuery):
                     await call.answer("Сумма оплаты не совпадает с ценой товара. Напишите в поддержку.", show_alert=True)
                     return
             except InvalidOperation:
-                logger.warning("Не удалось сравнить суммы: %s vs %s", invoice_amount, amount)
-                await call.answer(
-                    "Не удалось проверить сумму оплаты. Напишите в поддержку через /help.",
-                    show_alert=True
-                )
+                await call.answer("Не удалось проверить сумму оплаты. Напишите в поддержку через /help.", show_alert=True)
                 return
         if invoice_asset and invoice_asset != asset:
-            logger.warning(
-                "Invoice asset mismatch: expected=%s got=%s user=%s product=%s",
-                asset, invoice_asset, user.id, pid
-            )
             await call.answer("Валюта оплаты не совпадает. Напишите в поддержку.", show_alert=True)
             return
 
@@ -1953,7 +1876,6 @@ async def cb_check_crypto(call: types.CallbackQuery):
             await call.answer("Оплата есть, но не удалось сохранить покупку. Напишите в поддержку.", show_alert=True)
             return
 
-        # Удаляем pending order — оплата завершена
         loop2 = asyncio.get_running_loop()
         await loop2.run_in_executor(
             None, _db_delete_pending_order, "crypto", str(invoice_id), user.id
@@ -1973,7 +1895,7 @@ async def cb_check_crypto(call: types.CallbackQuery):
 
 
 # =========================
-# СКАЧАТЬ ИЗ МОИХ ПОКУПОК (не зависит от active)
+# СКАЧАТЬ ИЗ МОИ ПОКУПОК
 # =========================
 
 @dp.callback_query_handler(lambda c: c.data.startswith("dl:"))
@@ -1987,7 +1909,6 @@ async def cb_download(call: types.CallbackQuery):
         return
 
     file_id_from_row = _to_str(purchase_row.get("file_id"))
-
     if not file_id_from_row:
         _all_products = await load_products()
         product = next((p for p in _all_products if p["product_id"] == pid), None)
@@ -2002,7 +1923,7 @@ async def cb_download(call: types.CallbackQuery):
 
 # =========================
 # STARS PAYMENT
-# FIX #3: total_amount для Stars — это количество звёзд (не копейки)
+# FIX: исправлен парсинг payload — pid теперь в конце, не в середине
 # =========================
 
 @dp.pre_checkout_query_handler(lambda q: True)
@@ -2013,20 +1934,24 @@ async def pre_checkout(pre_checkout_q: types.PreCheckoutQuery):
 @dp.message_handler(content_types=types.ContentType.SUCCESSFUL_PAYMENT)
 async def successful_payment(message: types.Message):
     payload = message.successful_payment.invoice_payload
+
+    # FIX: новый формат payload: "buystars:{user_id}:{timestamp_ms}:{pid}"
+    # pid — последним, чтобы он мог содержать любые символы кроме первых двух ":"
     if not payload.startswith("buystars:"):
         await message.answer("Оплата получена, но товар не распознан.")
         return
 
-    # payload = "buystars:{user_id}:{pid}:{timestamp_ms}"
-    stars_order_key = payload.split("buystars:", 1)[1].strip()
-    key_parts = stars_order_key.split(":")
-    # Строгая проверка формата ключа
-    if len(key_parts) != 3:
+    rest = payload[len("buystars:"):]
+    # Разбиваем только первые два ":" — остаток идёт в pid
+    parts = rest.split(":", 2)
+    if len(parts) != 3:
         logger.error("Stars payload неожиданного формата: %r", payload)
         await message.answer("Ошибка данных оплаты. Напишите в поддержку через /help.")
         return
-    payload_user_id, pid, _ = key_parts
-    # Проверяем что payload принадлежит текущему пользователю
+
+    payload_user_id, timestamp_ms, pid = parts
+    stars_order_key = f"{payload_user_id}:{timestamp_ms}"
+
     if payload_user_id != str(message.from_user.id):
         logger.warning(
             "Stars payload user mismatch: payload_user=%s actual_user=%s",
@@ -2040,7 +1965,6 @@ async def successful_payment(message: types.Message):
         None, _db_get_pending_order, "stars", stars_order_key, message.from_user.id
     )
     if pending:
-        # Проверяем консистентность snapshot
         if pending.get("product_id") != pid:
             logger.error("Stars pending order mismatch: key=%s pending.product_id=%s pid=%s",
                          stars_order_key, pending.get("product_id"), pid)
@@ -2053,20 +1977,16 @@ async def successful_payment(message: types.Message):
             "price_xtr": pending.get("expected_amount", "0"),
         }
     else:
-        # Аномалия: pending не найден при успешной оплате Stars
         logger.warning(
             "Stars successful_payment без pending: user=%s pid=%s key=%s",
             message.from_user.id, pid, stars_order_key
         )
-        # Fallback на CSV
         _all_products = await load_products()
         product = next((p for p in _all_products if p["product_id"] == pid), None)
         if not product:
             await message.answer("Оплата получена, но материал сейчас недоступен. Напишите в поддержку через /help.")
             return
 
-    # FIX #3: для XTR (Stars) total_amount = кол-во звёзд напрямую.
-    # В таблице price_xtr должно быть целое число звёзд (например: 100).
     expected = int(product["price_xtr"])
     paid_amount = int(message.successful_payment.total_amount)
 
@@ -2079,7 +1999,6 @@ async def successful_payment(message: types.Message):
         return
 
     user = message.from_user
-
     ok = await grant_product_to_user(
         chat_id=message.chat.id,
         user=user,
@@ -2090,7 +2009,6 @@ async def successful_payment(message: types.Message):
         await message.answer("Оплата получена, но не удалось сохранить покупку. Напишите в поддержку.")
         return
 
-    # Удаляем pending order
     loop2 = asyncio.get_running_loop()
     await loop2.run_in_executor(
         None, _db_delete_pending_order, "stars", stars_order_key, message.from_user.id
@@ -2104,8 +2022,7 @@ async def successful_payment(message: types.Message):
 
 
 # =========================
-# ADMIN: refresh caches + debug file_id (doc/photo)
-# FIX #7: user_id передаётся как список
+# ADMIN: refresh + debug
 # =========================
 
 @dp.message_handler(commands=["refresh"], user_id=ADMIN_IDS)
@@ -2113,7 +2030,6 @@ async def cmd_refresh(message: types.Message):
     global _products_cache, _purchases_sheet_title
     _products_cache = (0.0, [])
     _purchases_sheet_title = None
-    # Чистим устаревшие pending orders
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _db_cleanup_pending_orders)
     logger.info("Admin triggered cache refresh + pending cleanup")
@@ -2142,22 +2058,20 @@ async def debug_get_file_id_photo(message: types.Message):
 # =========================
 
 class AddProduct(StatesGroup):
-    waiting_pdf          = State()
-    waiting_preview      = State()
-    waiting_title        = State()
-    waiting_desc         = State()
-    waiting_category     = State()
-    waiting_price_xtr    = State()
+    waiting_pdf = State()
+    waiting_preview = State()
+    waiting_title = State()
+    waiting_desc = State()
+    waiting_category = State()
+    waiting_price_xtr = State()
     waiting_price_crypto = State()
-    confirm              = State()
+    confirm = State()
 
 
 class EditProduct(StatesGroup):
     choosing_field = State()
-    waiting_value  = State()
+    waiting_value = State()
 
-
-# ---- admin keyboards ----
 
 def admin_main_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
@@ -2196,14 +2110,12 @@ def admin_confirm_kb() -> InlineKeyboardMarkup:
 
 
 def cancel_kb() -> InlineKeyboardMarkup:
-    """Кнопка отмены — добавляется к каждому шагу добавления товара."""
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("❌ Отменить добавление", callback_data="adm:cancel"))
     return kb
 
 
 def admin_category_kb(categories: list) -> InlineKeyboardMarkup:
-    """Кнопки с существующими категориями + новая."""
     kb = InlineKeyboardMarkup(row_width=1)
     for cat in categories:
         kb.add(InlineKeyboardButton(cat, callback_data=f"adm:cat:{cat}"))
@@ -2238,8 +2150,6 @@ def _format_admin_card(p: dict) -> str:
     )
 
 
-# ---- /admin ----
-
 @dp.message_handler(commands=["admin"], user_id=ADMIN_IDS)
 async def cmd_admin(message: types.Message):
     await message.answer(
@@ -2262,45 +2172,6 @@ async def adm_back(call: types.CallbackQuery):
         await call.message.answer("🛠 <b>Панель управления</b>", reply_markup=admin_main_kb(), parse_mode="HTML")
 
 
-def admin_categories_kb(categories: list) -> InlineKeyboardMarkup:
-    """Кнопки категорий для списка товаров в админке."""
-    kb = InlineKeyboardMarkup(row_width=1)
-    for cat in categories:
-        # Считаем товары в категории
-        kb.add(InlineKeyboardButton(cat, callback_data=f"adm:listcat:{cat}"))
-    kb.add(InlineKeyboardButton("📋 Все товары", callback_data="adm:listcat:__all__"))
-    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="adm:back"))
-    return kb
-
-
-async def _show_products_in_category(chat_id: int, products: list) -> None:
-    """Отправляет карточки товаров списком."""
-    for p in products:
-        active = bool(p.get("active", 1))
-        status = "🟢" if active else "🔴"
-        price_xtr = int(p.get("price_xtr", 0) or 0)
-        kb = InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            InlineKeyboardButton("✏️ Ред.", callback_data=f"adm:edit:{p['product_id']}"),
-            InlineKeyboardButton(
-                "🔴 Откл." if active else "🟢 Вкл.",
-                callback_data=f"adm:toggle:{p['product_id']}"
-            ),
-        )
-        text = (
-            f"{status} <b>{p['title']}</b>\n"
-            f"📂 {p.get('category', '—')}  |  "
-            + (f"⭐ {price_xtr} Stars" if price_xtr else "🎁 Бесплатно")
-            + f"\n<code>{p['product_id']}</code>"
-        )
-        await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
-    # Кнопка возврата к категориям
-    back_kb = InlineKeyboardMarkup().add(
-        InlineKeyboardButton("⬅️ К категориям", callback_data="adm:list")
-    )
-    await bot.send_message(chat_id, "─────────────", reply_markup=back_kb)
-
-
 @dp.callback_query_handler(lambda c: c.data == "adm:list", user_id=ADMIN_IDS)
 async def adm_list(call: types.CallbackQuery):
     await call.answer()
@@ -2309,31 +2180,25 @@ async def adm_list(call: types.CallbackQuery):
     if not products:
         await call.message.answer("Товаров пока нет.", reply_markup=admin_main_kb())
         return
-    # Собираем уникальные категории
+
     cats = sorted({p.get("category", "Без категории") for p in products})
     total = len(products)
-    # Добавляем счётчик товаров к каждой категории
-    cat_counts = {}
+    cat_counts: Dict[str, int] = {}
     for p in products:
         cat = p.get("category", "Без категории")
         cat_counts[cat] = cat_counts.get(cat, 0) + 1
-    cats_with_count = [f"{c} ({cat_counts[c]})" for c in cats]
 
     kb = InlineKeyboardMarkup(row_width=1)
-    for i, cat in enumerate(cats):
+    for cat in cats:
         kb.add(InlineKeyboardButton(
-            cats_with_count[i],
+            f"{cat} ({cat_counts[cat]})",
             callback_data=f"adm:listcat:{cat}"
         ))
     kb.add(InlineKeyboardButton(f"📋 Все товары ({total})", callback_data="adm:listcat:__all__"))
     kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="adm:back"))
 
     try:
-        await call.message.edit_text(
-            "📂 <b>Выбери категорию:</b>",
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
+        await call.message.edit_text("📂 <b>Выбери категорию:</b>", reply_markup=kb, parse_mode="HTML")
     except Exception:
         await call.message.answer("📂 <b>Выбери категорию:</b>", reply_markup=kb, parse_mode="HTML")
 
@@ -2358,6 +2223,32 @@ async def adm_list_category(call: types.CallbackQuery):
 
     await call.message.answer(f"<b>{title}</b>", parse_mode="HTML")
     await _show_products_in_category(call.message.chat.id, products)
+
+
+async def _show_products_in_category(chat_id: int, products: list) -> None:
+    for p in products:
+        active = bool(p.get("active", 1))
+        status = "🟢" if active else "🔴"
+        price_xtr = int(p.get("price_xtr", 0) or 0)
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton("✏️ Ред.", callback_data=f"adm:edit:{p['product_id']}"),
+            InlineKeyboardButton(
+                "🔴 Откл." if active else "🟢 Вкл.",
+                callback_data=f"adm:toggle:{p['product_id']}"
+            ),
+        )
+        text = (
+            f"{status} <b>{p['title']}</b>\n"
+            f"📂 {p.get('category', '—')}  |  "
+            + (f"⭐ {price_xtr} Stars" if price_xtr else "🎁 Бесплатно")
+            + f"\n<code>{p['product_id']}</code>"
+        )
+        await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+    back_kb = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("⬅️ К категориям", callback_data="adm:list")
+    )
+    await bot.send_message(chat_id, "─────────────", reply_markup=back_kb)
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("adm:toggle:"), user_id=ADMIN_IDS)
@@ -2504,7 +2395,6 @@ async def adm_got_desc(message: types.Message, state: FSMContext):
 
 
 async def _send_category_choice(chat_id: int, text_prefix: str = "Шаг 5/7: Выбери <b>категорию</b>") -> None:
-    """Отправляет кнопки с существующими категориями."""
     loop = asyncio.get_running_loop()
     products = await loop.run_in_executor(None, _db_get_all_products, False)
     cats = sorted({p.get("category", "") for p in products if p.get("category")})
@@ -2523,9 +2413,10 @@ async def _send_category_choice(chat_id: int, text_prefix: str = "Шаг 5/7: В
         )
 
 
-# Выбор существующей категории через кнопку
-@dp.callback_query_handler(lambda c: c.data.startswith("adm:cat:") and not c.data.startswith("adm:cat:__new__"),
-                            user_id=ADMIN_IDS, state=AddProduct.waiting_category)
+@dp.callback_query_handler(
+    lambda c: c.data.startswith("adm:cat:") and not c.data.startswith("adm:cat:__new__"),
+    user_id=ADMIN_IDS, state=AddProduct.waiting_category
+)
 async def adm_pick_category(call: types.CallbackQuery, state: FSMContext):
     category = call.data.split("adm:cat:", 1)[1]
     await call.answer()
@@ -2539,15 +2430,15 @@ async def adm_pick_category(call: types.CallbackQuery, state: FSMContext):
     )
 
 
-# Пользователь хочет создать новую категорию
-@dp.callback_query_handler(lambda c: c.data == "adm:cat:__new__",
-                            user_id=ADMIN_IDS, state=AddProduct.waiting_category)
+@dp.callback_query_handler(
+    lambda c: c.data == "adm:cat:__new__",
+    user_id=ADMIN_IDS, state=AddProduct.waiting_category
+)
 async def adm_new_category_prompt(call: types.CallbackQuery):
     await call.answer()
     await call.message.answer("Введи название <b>новой категории</b>:", reply_markup=cancel_kb(), parse_mode="HTML")
 
 
-# Ввод новой категории текстом
 @dp.message_handler(user_id=ADMIN_IDS, state=AddProduct.waiting_category)
 async def adm_got_category(message: types.Message, state: FSMContext):
     category = message.text.strip()
@@ -2677,6 +2568,8 @@ async def adm_edit_product(call: types.CallbackQuery, state: FSMContext):
 @dp.callback_query_handler(lambda c: c.data.startswith("adm:ef:"), user_id=ADMIN_IDS, state="*")
 async def adm_edit_field(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
+    # FIX: state.finish() перед установкой нового состояния — очищаем предыдущее
+    await state.finish()
     parts = call.data.split(":")
     pid, field = parts[2], parts[3]
     await state.update_data(editing_product_id=pid, editing_field=field)
@@ -2684,7 +2577,6 @@ async def adm_edit_field(call: types.CallbackQuery, state: FSMContext):
     prompts = {
         "title": "Введи новое <b>название</b>:",
         "desc": "Введи новое <b>описание</b> (или <b>нет</b> для пустого):",
-        "category": None,  # обрабатывается отдельно
         "price_xtr": "Введи новую цену в <b>Stars</b> (целое число):",
         "price_crypto": "Введи новую цену в <b>крипте</b> или <b>нет</b>:",
         "file_id": "Отправь новый <b>PDF-файл</b>:",
@@ -2696,10 +2588,11 @@ async def adm_edit_field(call: types.CallbackQuery, state: FSMContext):
         await call.message.answer(prompts.get(field, "Введи новое значение:"), parse_mode="HTML")
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("adm:cat:") and not c.data.startswith("adm:cat:__new__"),
-                            user_id=ADMIN_IDS, state=EditProduct.waiting_value)
+@dp.callback_query_handler(
+    lambda c: c.data.startswith("adm:cat:") and not c.data.startswith("adm:cat:__new__"),
+    user_id=ADMIN_IDS, state=EditProduct.waiting_value
+)
 async def adm_edit_pick_category(call: types.CallbackQuery, state: FSMContext):
-    """Выбор существующей категории при редактировании."""
     data = await state.get_data()
     if data.get("editing_field") != "category":
         await call.answer()
@@ -2723,10 +2616,11 @@ async def adm_edit_pick_category(call: types.CallbackQuery, state: FSMContext):
         await call.message.answer("❌ Не удалось обновить.", reply_markup=admin_main_kb())
 
 
-@dp.callback_query_handler(lambda c: c.data == "adm:cat:__new__",
-                            user_id=ADMIN_IDS, state=EditProduct.waiting_value)
+@dp.callback_query_handler(
+    lambda c: c.data == "adm:cat:__new__",
+    user_id=ADMIN_IDS, state=EditProduct.waiting_value
+)
 async def adm_edit_new_category_prompt(call: types.CallbackQuery):
-    """Запрос ввода новой категории при редактировании."""
     await call.answer()
     await call.message.answer("Введи название <b>новой категории</b>:", parse_mode="HTML")
 
@@ -2755,7 +2649,8 @@ async def adm_save_field(message: types.Message, state: FSMContext):
     elif field == "price_xtr":
         try:
             v = int(text)
-            if v < 0: raise ValueError
+            if v < 0:
+                raise ValueError
             update["price_xtr"] = v
         except ValueError:
             await message.answer("⚠️ Введи целое неотрицательное число.")
@@ -2801,7 +2696,6 @@ async def adm_save_field(message: types.Message, state: FSMContext):
         await message.answer("❌ Не удалось обновить.", reply_markup=admin_main_kb())
 
 
-
 # =========================
 # АНИМИРОВАННЫЙ СТАРТ
 # =========================
@@ -2835,8 +2729,32 @@ async def admin_got_animation(message: types.Message):
 
 
 # =========================
-# ИЗБРАННОЕ
+# ИЗБРАННОЕ — toggle (из карточки товара)
 # =========================
+
+@dp.callback_query_handler(lambda c: c.data.startswith("fav:toggle:"))
+async def cb_fav_toggle(call: types.CallbackQuery):
+    # format: fav:toggle:{pid}:{category_key}
+    parts = call.data.split(":")
+    if len(parts) < 4:
+        await call.answer("Некорректная кнопка.", show_alert=True)
+        return
+    pid = parts[2]
+    category_key = parts[3]
+    user = call.from_user
+    loop = asyncio.get_running_loop()
+    added = await loop.run_in_executor(None, _db_toggle_favourite, user.id, pid)
+    await call.answer("❤️ Добавлено в избранное!" if added else "💔 Убрано из избранного")
+    # Обновляем кнопки на карточке
+    try:
+        _all_products = await load_products()
+        product = next((p for p in _all_products if p["product_id"] == pid), None)
+        if product:
+            kb = product_action_kb_fav(product, category_key, added)
+            await call.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+
 
 def product_action_kb_fav(product: Dict[str, Any], category_key: str,
                            is_fav: bool) -> InlineKeyboardMarkup:
@@ -2851,80 +2769,16 @@ def product_action_kb_fav(product: Dict[str, Any], category_key: str,
     else:
         if price_xtr > 0:
             kb.add(InlineKeyboardButton(f"⭐ Купить за {price_xtr} Stars",
-                                         callback_data=f"paystars:{pid}"))
+                                        callback_data=f"paystars:{pid}"))
         if can_buy_with_crypto(product):
             kb.add(InlineKeyboardButton(f"💰 Купить за {price_crypto_raw} {crypto_asset}",
-                                         callback_data=f"paycrypto:{pid}"))
+                                        callback_data=f"paycrypto:{pid}"))
+
     fav_text = "❤️ В избранном" if is_fav else "🤍 В избранное"
-    kb.add(InlineKeyboardButton(fav_text, callback_data=f"fav:{pid}:{category_key}"))
+    kb.add(InlineKeyboardButton(fav_text, callback_data=f"fav:toggle:{pid}:{category_key}"))
     kb.add(InlineKeyboardButton("⬅️ Назад к списку", callback_data=f"back_items:{category_key}"))
     kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
     return kb
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("fav:"))
-async def cb_fav_toggle(call: types.CallbackQuery):
-    parts = call.data.split(":")
-    pid = parts[1]
-    category_key = parts[2] if len(parts) > 2 else ""
-    user = call.from_user
-    loop = asyncio.get_running_loop()
-    added = await loop.run_in_executor(None, _db_toggle_favourite, user.id, pid)
-    await call.answer("❤️ Добавлено в избранное!" if added else "💔 Убрано из избранного")
-    try:
-        _all_products = await load_products()
-        product = next((p for p in _all_products if p["product_id"] == pid), None)
-        if product:
-            kb = product_action_kb_fav(product, category_key, added)
-            await call.message.edit_reply_markup(reply_markup=kb)
-    except Exception:
-        pass
-
-
-@dp.callback_query_handler(lambda c: c.data == "open:favourites")
-async def cb_open_favourites(call: types.CallbackQuery):
-    await call.answer()
-    user = call.from_user
-    loop = asyncio.get_running_loop()
-    fav_ids = await loop.run_in_executor(None, _db_get_favourites, user.id)
-    if not fav_ids:
-        kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(InlineKeyboardButton("📚 Каталог", callback_data="open:catalog"))
-        kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
-        try:
-            await call.message.edit_text(
-                "🤍 <b>Избранное пусто</b>\n\nДобавляй товары кнопкой 🤍 на карточке",
-                reply_markup=kb, parse_mode="HTML"
-            )
-        except Exception:
-            await call.message.answer(
-                "🤍 <b>Избранное пусто</b>", reply_markup=kb, parse_mode="HTML"
-            )
-        return
-    all_products = await load_products()
-    prod_map = {p["product_id"]: p for p in all_products}
-    await call.message.answer("❤️ <b>Избранное:</b>", parse_mode="HTML")
-    for pid in fav_ids:
-        product = prod_map.get(pid)
-        if not product:
-            continue
-        is_bought = await user_has_purchase(user.id, pid)
-        price_xtr = int(product.get("price_xtr", 0) or 0)
-        status = "✅ Куплено" if is_bought else (
-            "🎁 Бесплатно" if is_free_product(product) else f"⭐ {price_xtr} Stars"
-        )
-        kb = InlineKeyboardMarkup(row_width=2)
-        cat_key = _cat_key(_to_str(product.get("category", "")))
-        _cat_key_to_name[cat_key] = _to_str(product.get("category", ""))
-        if is_bought:
-            kb.add(InlineKeyboardButton("📥 Скачать", callback_data=f"dl:{pid}"))
-        else:
-            kb.add(InlineKeyboardButton("👁 Посмотреть", callback_data=f"item:{pid}:{cat_key}"))
-        kb.add(InlineKeyboardButton("💔 Убрать", callback_data=f"fav:{pid}:"))
-        await call.message.answer(
-            f"📄 <b>{product['title']}</b>\n{status}",
-            reply_markup=kb, parse_mode="HTML"
-        )
 
 
 # =========================
@@ -2932,17 +2786,17 @@ async def cb_open_favourites(call: types.CallbackQuery):
 # =========================
 
 class QuizState(StatesGroup):
-    age      = State()
+    age = State()
     interest = State()
 
 
 AGE_GROUPS = ["3-4 года", "4-5 лет", "5-6 лет", "6-8 лет"]
-INTERESTS  = ["Творчество", "Наука", "Логика", "Всё понемногу"]
+INTERESTS = ["Творчество", "Наука", "Логика", "Всё понемногу"]
 
 INTEREST_KEYWORDS: Dict[str, list] = {
     "Творчество": ["детск", "задан", "разукрашк"],
-    "Наука":      ["науч", "сказк", "знайк"],
-    "Логика":     ["развивающ", "вопрос", "логик"],
+    "Наука": ["науч", "сказк", "знайк"],
+    "Логика": ["развивающ", "вопрос", "логик"],
     "Всё понемногу": [],
 }
 
@@ -3053,10 +2907,9 @@ class ReviewState(StatesGroup):
 
 
 async def send_review_requests():
-    """Проверяет и отправляет запросы отзывов."""
     loop = asyncio.get_running_loop()
-    requests = await loop.run_in_executor(None, _db_get_pending_review_requests)
-    for req in requests:
+    requests_list = await loop.run_in_executor(None, _db_get_pending_review_requests)
+    for req in requests_list:
         try:
             user_id = int(req["user_id"])
             product_id = req["product_id"]
@@ -3145,13 +2998,6 @@ async def _finalize_review(user, product_id: str, rating: int, comment: str):
     await loop.run_in_executor(None, _db_add_review, user, product_id, title, rating, comment)
 
 
-def _db_get_review_by_id(review_id: int) -> Optional[Dict]:
-    with _get_db() as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
-    return dict(row) if row else None
-
-
 @dp.callback_query_handler(lambda c: c.data.startswith("rev:del:"))
 async def cb_review_delete(call: types.CallbackQuery):
     review_id = int(call.data.split(":")[2])
@@ -3172,8 +3018,8 @@ async def cb_review_delete(call: types.CallbackQuery):
         pass
 
 
-async def get_reviews_text(product_id: str) -> str:
-    """Текст с рейтингом для карточки товара."""
+async def _get_reviews_text(product_id: str) -> str:
+    """FIX: Единственное определение — дублирование устранено."""
     loop = asyncio.get_running_loop()
     reviews = await loop.run_in_executor(None, _db_get_reviews, product_id)
     if not reviews:
@@ -3191,56 +3037,52 @@ async def get_reviews_text(product_id: str) -> str:
     return "\n".join(lines)
 
 
-async def format_product_card_full(product: Dict[str, Any]) -> str:
-    """Карточка товара с отзывами."""
-    base = format_product_card(product)
-    reviews_text = await get_reviews_text(product["product_id"])
-    return base + reviews_text if reviews_text else base
-
-
 # =========================
 # ПОХОЖИЕ ТОВАРЫ ПОСЛЕ ПОКУПКИ
 # =========================
 
-async def _suggest_more(chat_id: int, user_id: int, product: Dict[str, Any]) -> None:
-    """После покупки предлагает товары из той же серии."""
+async def _safe_suggest_more(chat_id: int, user_id: int, product: Dict[str, Any]) -> None:
+    """FIX: обёртка с обработкой исключений для фоновой задачи."""
     try:
-        await asyncio.sleep(1)  # небольшая пауза чтобы файл пришёл первым
-        all_products = await load_products()
-        category = product.get("category", "")
-        suggestions = []
-        for p in all_products:
-            if (p.get("category") == category
-                    and p["product_id"] != product["product_id"]
-                    and not await user_has_purchase(user_id, p["product_id"])):
-                suggestions.append(p)
-                if len(suggestions) >= 3:
-                    break
-        if not suggestions:
-            return
-        kb = InlineKeyboardMarkup(row_width=1)
-        for p in suggestions:
-            cat_key = _cat_key(_to_str(p.get("category", "")))
-            _cat_key_to_name[cat_key] = _to_str(p.get("category", ""))
-            price_xtr = int(p.get("price_xtr", 0) or 0)
-            price_str = "🎁" if is_free_product(p) else f"⭐{price_xtr}"
-            kb.add(InlineKeyboardButton(
-                f"{price_str} {p['title']}",
-                callback_data=f"item:{p['product_id']}:{cat_key}"
-            ))
-        await bot.send_message(
-            chat_id,
-            "🎯 <b>Попробуйте ещё из этой серии:</b>",
-            reply_markup=kb,
-            parse_mode="HTML"
-        )
+        await _suggest_more(chat_id, user_id, product)
     except Exception as e:
-        logger.warning("_suggest_more error: %s", e)
+        logger.warning("_safe_suggest_more error: %s", e)
 
+
+async def _suggest_more(chat_id: int, user_id: int, product: Dict[str, Any]) -> None:
+    await asyncio.sleep(1)
+    all_products = await load_products()
+    category = product.get("category", "")
+    suggestions = []
+    for p in all_products:
+        if (p.get("category") == category
+                and p["product_id"] != product["product_id"]
+                and not await user_has_purchase(user_id, p["product_id"])):
+            suggestions.append(p)
+            if len(suggestions) >= 3:
+                break
+    if not suggestions:
+        return
+    kb = InlineKeyboardMarkup(row_width=1)
+    for p in suggestions:
+        cat_key = _cat_key(_to_str(p.get("category", "")))
+        _cat_key_to_name[cat_key] = _to_str(p.get("category", ""))
+        price_xtr = int(p.get("price_xtr", 0) or 0)
+        price_str = "🎁" if is_free_product(p) else f"⭐{price_xtr}"
+        kb.add(InlineKeyboardButton(
+            f"{price_str} {p['title']}",
+            callback_data=f"item:{p['product_id']}:{cat_key}"
+        ))
+    await bot.send_message(
+        chat_id,
+        "🎯 <b>Попробуйте ещё из этой серии:</b>",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
 
 
 # =========================
-# WEBHOOK / POLLING — автовыбор
+# WEBHOOK / POLLING
 # =========================
 
 WEBHOOK_HOST = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
@@ -3250,20 +3092,18 @@ WEBAPP_PORT = int(os.getenv("PORT", 8080))
 
 
 async def _review_request_loop():
-    """Фоновый цикл: каждые 30 минут проверяем и отправляем запросы отзывов."""
     while True:
         try:
             await send_review_requests()
         except Exception as e:
             logger.warning("review_request_loop error: %s", e)
-        await asyncio.sleep(1800)  # 30 минут
+        await asyncio.sleep(1800)
 
 
 async def on_startup(dp):
     init_db()
     _db_cleanup_pending_orders()
     await _setup_bot_commands()
-    # Запускаем фоновый цикл отзывов
     asyncio.create_task(_review_request_loop())
     if WEBHOOK_URL:
         await bot.set_webhook(WEBHOOK_URL)
@@ -3273,17 +3113,14 @@ async def on_startup(dp):
 
 
 async def _setup_bot_commands():
-    """Устанавливает команды бота: разные для пользователей и для админов."""
     from aiogram.types import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 
-    # Команды для всех пользователей
     user_commands = [
         BotCommand("start", "🏠 Главная"),
         BotCommand("help", "❓ Поддержка"),
     ]
     await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
 
-    # Команды для каждого админа (включают admin + refresh)
     admin_commands = [
         BotCommand("start", "🏠 Главная"),
         BotCommand("admin", "🛠 Панель управления"),
@@ -3310,7 +3147,6 @@ async def on_shutdown(dp):
 
 if __name__ == "__main__":
     if WEBHOOK_URL:
-        # aiogram 2.x встроенный webhook через executor
         executor.start_webhook(
             dispatcher=dp,
             webhook_path=WEBHOOK_PATH,
@@ -3322,5 +3158,5 @@ if __name__ == "__main__":
         )
     else:
         init_db()
-        _db_cleanup_pending_orders()  # Чистим устаревшие pending при старте
-        executor.start_polling(dp, skip_updates=True)
+        _db_cleanup_pending_orders()
+        executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
