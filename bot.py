@@ -49,8 +49,9 @@ DB_PATH = os.getenv("DB_PATH", "purchases.db").strip()
 PURCHASES_SHEET_ID = os.getenv("PURCHASES_SHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
-# Админ и поддержка
-ADMIN_CHAT_ID = 8491241832
+# Админы (список ID)
+ADMIN_IDS = [8491241832, 627225180, 481246770]
+ADMIN_CHAT_ID = 8491241832  # главный админ — получает уведомления о покупках
 AUTHOR_USERNAME = "art_kids_support"  # без @
 
 # Telegram Stars
@@ -1873,7 +1874,7 @@ async def successful_payment(message: types.Message):
 # FIX #7: user_id передаётся как список
 # =========================
 
-@dp.message_handler(commands=["refresh"], user_id=[ADMIN_CHAT_ID])
+@dp.message_handler(commands=["refresh"], user_id=ADMIN_IDS)
 async def cmd_refresh(message: types.Message):
     global _products_cache, _purchases_sheet_title
     _products_cache = (0.0, [])
@@ -1885,7 +1886,7 @@ async def cmd_refresh(message: types.Message):
     await message.answer("✅ Кеш товаров очищен. Старые незавершённые заказы удалены.")
 
 
-@dp.message_handler(content_types=types.ContentType.DOCUMENT, user_id=[ADMIN_CHAT_ID])
+@dp.message_handler(content_types=types.ContentType.DOCUMENT, user_id=ADMIN_IDS)
 async def debug_get_file_id_doc(message: types.Message):
     await message.reply(
         f"📄 file_id:\n<code>{message.document.file_id}</code>",
@@ -1893,7 +1894,7 @@ async def debug_get_file_id_doc(message: types.Message):
     )
 
 
-@dp.message_handler(content_types=types.ContentType.PHOTO, user_id=[ADMIN_CHAT_ID])
+@dp.message_handler(content_types=types.ContentType.PHOTO, user_id=ADMIN_IDS)
 async def debug_get_file_id_photo(message: types.Message):
     photo = message.photo[-1]
     await message.reply(
@@ -2005,7 +2006,7 @@ def _format_admin_card(p: dict) -> str:
 
 # ---- /admin ----
 
-@dp.message_handler(commands=["admin"], user_id=[ADMIN_CHAT_ID])
+@dp.message_handler(commands=["admin"], user_id=ADMIN_IDS)
 async def cmd_admin(message: types.Message):
     await message.answer(
         "🛠 <b>Панель управления</b>",
@@ -2014,7 +2015,7 @@ async def cmd_admin(message: types.Message):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data == "adm:back", user_id=[ADMIN_CHAT_ID])
+@dp.callback_query_handler(lambda c: c.data == "adm:back", user_id=ADMIN_IDS)
 async def adm_back(call: types.CallbackQuery):
     await call.answer()
     try:
@@ -2027,15 +2028,19 @@ async def adm_back(call: types.CallbackQuery):
         await call.message.answer("🛠 <b>Панель управления</b>", reply_markup=admin_main_kb(), parse_mode="HTML")
 
 
-@dp.callback_query_handler(lambda c: c.data == "adm:list", user_id=[ADMIN_CHAT_ID])
-async def adm_list(call: types.CallbackQuery):
-    await call.answer()
-    loop = asyncio.get_running_loop()
-    products = await loop.run_in_executor(None, _db_get_all_products, False)
-    if not products:
-        await call.message.answer("Товаров пока нет.", reply_markup=admin_main_kb())
-        return
-    await call.message.answer(f"📋 Товаров: {len(products)}")
+def admin_categories_kb(categories: list) -> InlineKeyboardMarkup:
+    """Кнопки категорий для списка товаров в админке."""
+    kb = InlineKeyboardMarkup(row_width=1)
+    for cat in categories:
+        # Считаем товары в категории
+        kb.add(InlineKeyboardButton(cat, callback_data=f"adm:listcat:{cat}"))
+    kb.add(InlineKeyboardButton("📋 Все товары", callback_data="adm:listcat:__all__"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="adm:back"))
+    return kb
+
+
+async def _show_products_in_category(chat_id: int, products: list) -> None:
+    """Отправляет карточки товаров списком."""
     for p in products:
         active = bool(p.get("active", 1))
         status = "🟢" if active else "🔴"
@@ -2054,10 +2059,74 @@ async def adm_list(call: types.CallbackQuery):
             + (f"⭐ {price_xtr} Stars" if price_xtr else "🎁 Бесплатно")
             + f"\n<code>{p['product_id']}</code>"
         )
-        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+        await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+    # Кнопка возврата к категориям
+    back_kb = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("⬅️ К категориям", callback_data="adm:list")
+    )
+    await bot.send_message(chat_id, "─────────────", reply_markup=back_kb)
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("adm:toggle:"), user_id=[ADMIN_CHAT_ID])
+@dp.callback_query_handler(lambda c: c.data == "adm:list", user_id=ADMIN_IDS)
+async def adm_list(call: types.CallbackQuery):
+    await call.answer()
+    loop = asyncio.get_running_loop()
+    products = await loop.run_in_executor(None, _db_get_all_products, False)
+    if not products:
+        await call.message.answer("Товаров пока нет.", reply_markup=admin_main_kb())
+        return
+    # Собираем уникальные категории
+    cats = sorted({p.get("category", "Без категории") for p in products})
+    total = len(products)
+    # Добавляем счётчик товаров к каждой категории
+    cat_counts = {}
+    for p in products:
+        cat = p.get("category", "Без категории")
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+    cats_with_count = [f"{c} ({cat_counts[c]})" for c in cats]
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    for i, cat in enumerate(cats):
+        kb.add(InlineKeyboardButton(
+            cats_with_count[i],
+            callback_data=f"adm:listcat:{cat}"
+        ))
+    kb.add(InlineKeyboardButton(f"📋 Все товары ({total})", callback_data="adm:listcat:__all__"))
+    kb.add(InlineKeyboardButton("⬅️ Назад", callback_data="adm:back"))
+
+    try:
+        await call.message.edit_text(
+            "📂 <b>Выбери категорию:</b>",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    except Exception:
+        await call.message.answer("📂 <b>Выбери категорию:</b>", reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:listcat:"), user_id=ADMIN_IDS)
+async def adm_list_category(call: types.CallbackQuery):
+    await call.answer()
+    cat_raw = call.data.split("adm:listcat:", 1)[1]
+    loop = asyncio.get_running_loop()
+    all_products = await loop.run_in_executor(None, _db_get_all_products, False)
+
+    if cat_raw == "__all__":
+        products = all_products
+        title = f"📋 Все товары ({len(products)})"
+    else:
+        products = [p for p in all_products if p.get("category") == cat_raw]
+        title = f"📂 {cat_raw} ({len(products)})"
+
+    if not products:
+        await call.message.answer("В этой категории нет товаров.")
+        return
+
+    await call.message.answer(f"<b>{title}</b>", parse_mode="HTML")
+    await _show_products_in_category(call.message.chat.id, products)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:toggle:"), user_id=ADMIN_IDS)
 async def adm_toggle(call: types.CallbackQuery):
     pid = call.data.split("adm:toggle:", 1)[1]
     loop = asyncio.get_running_loop()
@@ -2085,7 +2154,7 @@ async def adm_toggle(call: types.CallbackQuery):
         pass
 
 
-@dp.callback_query_handler(lambda c: c.data == "adm:stats", user_id=[ADMIN_CHAT_ID])
+@dp.callback_query_handler(lambda c: c.data == "adm:stats", user_id=ADMIN_IDS)
 async def adm_stats(call: types.CallbackQuery):
     await call.answer()
     loop = asyncio.get_running_loop()
@@ -2106,7 +2175,7 @@ async def adm_stats(call: types.CallbackQuery):
         await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
-@dp.callback_query_handler(lambda c: c.data == "adm:refresh", user_id=[ADMIN_CHAT_ID])
+@dp.callback_query_handler(lambda c: c.data == "adm:refresh", user_id=ADMIN_IDS)
 async def adm_refresh_cb(call: types.CallbackQuery):
     await call.answer()
     global _products_cache, _purchases_sheet_title
@@ -2119,7 +2188,7 @@ async def adm_refresh_cb(call: types.CallbackQuery):
 
 # ---- ADD PRODUCT FSM ----
 
-@dp.callback_query_handler(lambda c: c.data == "adm:add", user_id=[ADMIN_CHAT_ID], state="*")
+@dp.callback_query_handler(lambda c: c.data == "adm:add", user_id=ADMIN_IDS, state="*")
 async def adm_add_start(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
     await state.finish()
@@ -2132,13 +2201,13 @@ async def adm_add_start(call: types.CallbackQuery, state: FSMContext):
     )
 
 
-@dp.message_handler(commands=["cancel"], user_id=[ADMIN_CHAT_ID], state="*")
+@dp.message_handler(commands=["cancel"], user_id=ADMIN_IDS, state="*")
 async def adm_cancel_cmd(message: types.Message, state: FSMContext):
     await state.finish()
     await message.answer("❌ Отменено.", reply_markup=admin_main_kb())
 
 
-@dp.callback_query_handler(lambda c: c.data == "adm:cancel", user_id=[ADMIN_CHAT_ID], state="*")
+@dp.callback_query_handler(lambda c: c.data == "adm:cancel", user_id=ADMIN_IDS, state="*")
 async def adm_cancel_cb(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
     await state.finish()
@@ -2147,7 +2216,7 @@ async def adm_cancel_cb(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message_handler(
     content_types=types.ContentType.DOCUMENT,
-    user_id=[ADMIN_CHAT_ID],
+    user_id=ADMIN_IDS,
     state=AddProduct.waiting_pdf
 )
 async def adm_got_pdf(message: types.Message, state: FSMContext):
@@ -2167,7 +2236,7 @@ async def adm_got_pdf(message: types.Message, state: FSMContext):
 
 @dp.message_handler(
     content_types=[types.ContentType.PHOTO, types.ContentType.TEXT],
-    user_id=[ADMIN_CHAT_ID],
+    user_id=ADMIN_IDS,
     state=AddProduct.waiting_preview
 )
 async def adm_got_preview(message: types.Message, state: FSMContext):
@@ -2177,7 +2246,7 @@ async def adm_got_preview(message: types.Message, state: FSMContext):
     await message.answer("Шаг 3/7: Введи <b>название</b> товара", reply_markup=cancel_kb(), parse_mode="HTML")
 
 
-@dp.message_handler(user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_title)
+@dp.message_handler(user_id=ADMIN_IDS, state=AddProduct.waiting_title)
 async def adm_got_title(message: types.Message, state: FSMContext):
     title = message.text.strip()
     if len(title) < 2:
@@ -2192,7 +2261,7 @@ async def adm_got_title(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message_handler(user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_desc)
+@dp.message_handler(user_id=ADMIN_IDS, state=AddProduct.waiting_desc)
 async def adm_got_desc(message: types.Message, state: FSMContext):
     desc = "" if message.text.strip().lower() == "нет" else message.text.strip()
     await state.update_data(description=desc)
@@ -2222,7 +2291,7 @@ async def _send_category_choice(chat_id: int, text_prefix: str = "Шаг 5/7: В
 
 # Выбор существующей категории через кнопку
 @dp.callback_query_handler(lambda c: c.data.startswith("adm:cat:") and not c.data.startswith("adm:cat:__new__"),
-                            user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_category)
+                            user_id=ADMIN_IDS, state=AddProduct.waiting_category)
 async def adm_pick_category(call: types.CallbackQuery, state: FSMContext):
     category = call.data.split("adm:cat:", 1)[1]
     await call.answer()
@@ -2238,14 +2307,14 @@ async def adm_pick_category(call: types.CallbackQuery, state: FSMContext):
 
 # Пользователь хочет создать новую категорию
 @dp.callback_query_handler(lambda c: c.data == "adm:cat:__new__",
-                            user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_category)
+                            user_id=ADMIN_IDS, state=AddProduct.waiting_category)
 async def adm_new_category_prompt(call: types.CallbackQuery):
     await call.answer()
     await call.message.answer("Введи название <b>новой категории</b>:", reply_markup=cancel_kb(), parse_mode="HTML")
 
 
 # Ввод новой категории текстом
-@dp.message_handler(user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_category)
+@dp.message_handler(user_id=ADMIN_IDS, state=AddProduct.waiting_category)
 async def adm_got_category(message: types.Message, state: FSMContext):
     category = message.text.strip()
     if len(category) < 2:
@@ -2261,7 +2330,7 @@ async def adm_got_category(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message_handler(user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_price_xtr)
+@dp.message_handler(user_id=ADMIN_IDS, state=AddProduct.waiting_price_xtr)
 async def adm_got_price_xtr(message: types.Message, state: FSMContext):
     try:
         price = int(message.text.strip())
@@ -2281,7 +2350,7 @@ async def adm_got_price_xtr(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message_handler(user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_price_crypto)
+@dp.message_handler(user_id=ADMIN_IDS, state=AddProduct.waiting_price_crypto)
 async def adm_got_price_crypto(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if text.lower() == "нет":
@@ -2328,7 +2397,7 @@ async def adm_got_price_crypto(message: types.Message, state: FSMContext):
         await message.answer(preview_text, reply_markup=admin_confirm_kb(), parse_mode="HTML")
 
 
-@dp.callback_query_handler(lambda c: c.data == "adm:confirm", user_id=[ADMIN_CHAT_ID], state=AddProduct.confirm)
+@dp.callback_query_handler(lambda c: c.data == "adm:confirm", user_id=ADMIN_IDS, state=AddProduct.confirm)
 async def adm_confirm_add(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
     data = await state.get_data()
@@ -2353,7 +2422,7 @@ async def adm_confirm_add(call: types.CallbackQuery, state: FSMContext):
 
 # ---- EDIT PRODUCT FSM ----
 
-@dp.callback_query_handler(lambda c: c.data.startswith("adm:edit:"), user_id=[ADMIN_CHAT_ID], state="*")
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:edit:"), user_id=ADMIN_IDS, state="*")
 async def adm_edit_product(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
     await state.finish()
@@ -2371,7 +2440,7 @@ async def adm_edit_product(call: types.CallbackQuery, state: FSMContext):
     )
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("adm:ef:"), user_id=[ADMIN_CHAT_ID], state="*")
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:ef:"), user_id=ADMIN_IDS, state="*")
 async def adm_edit_field(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
     parts = call.data.split(":")
@@ -2394,7 +2463,7 @@ async def adm_edit_field(call: types.CallbackQuery, state: FSMContext):
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("adm:cat:") and not c.data.startswith("adm:cat:__new__"),
-                            user_id=[ADMIN_CHAT_ID], state=EditProduct.waiting_value)
+                            user_id=ADMIN_IDS, state=EditProduct.waiting_value)
 async def adm_edit_pick_category(call: types.CallbackQuery, state: FSMContext):
     """Выбор существующей категории при редактировании."""
     data = await state.get_data()
@@ -2421,7 +2490,7 @@ async def adm_edit_pick_category(call: types.CallbackQuery, state: FSMContext):
 
 
 @dp.callback_query_handler(lambda c: c.data == "adm:cat:__new__",
-                            user_id=[ADMIN_CHAT_ID], state=EditProduct.waiting_value)
+                            user_id=ADMIN_IDS, state=EditProduct.waiting_value)
 async def adm_edit_new_category_prompt(call: types.CallbackQuery):
     """Запрос ввода новой категории при редактировании."""
     await call.answer()
@@ -2430,7 +2499,7 @@ async def adm_edit_new_category_prompt(call: types.CallbackQuery):
 
 @dp.message_handler(
     content_types=[types.ContentType.TEXT, types.ContentType.DOCUMENT, types.ContentType.PHOTO],
-    user_id=[ADMIN_CHAT_ID],
+    user_id=ADMIN_IDS,
     state=EditProduct.waiting_value
 )
 async def adm_save_field(message: types.Message, state: FSMContext):
