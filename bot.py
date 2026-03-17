@@ -1,3 +1,4 @@
+Content is user-generated and unverified.
 import os
 import re
 import json
@@ -214,6 +215,58 @@ def init_db() -> None:
                 UNIQUE(payment_method, external_invoice_id)
             )
         """)
+        # favourites: избранное пользователей
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS favourites (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                added_at   TEXT NOT NULL,
+                UNIQUE(user_id, product_id)
+            )
+        """)
+        # reviews: отзывы на товары
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS reviews (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      TEXT NOT NULL,
+                username     TEXT,
+                full_name    TEXT,
+                product_id   TEXT NOT NULL,
+                product_title TEXT,
+                rating       INTEGER NOT NULL,
+                comment      TEXT,
+                created_at   TEXT NOT NULL,
+                UNIQUE(user_id, product_id)
+            )
+        """)
+        # review_requests: когда отправить запрос отзыва
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS review_requests (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                send_after TEXT NOT NULL,
+                sent       INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, product_id)
+            )
+        """)
+        # bot_settings: настройки бота (gif, etc.)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        # quiz_results: результаты квиза для рекомендаций
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS quiz_results (
+                user_id    TEXT PRIMARY KEY,
+                age_group  TEXT,
+                interest   TEXT,
+                updated_at TEXT NOT NULL
+            )
+        """)
         # products: основное хранилище товаров (вместо Google Sheets CSV)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS products (
@@ -348,6 +401,167 @@ def _db_get_stats() -> Dict[str, Any]:
         "top_products": [(r[0], r[1]) for r in top],
         "today": today,
     }
+
+
+# ---- bot_settings CRUD ----
+
+def _db_get_setting(key: str, default: str = "") -> str:
+    try:
+        with _get_db() as conn:
+            row = conn.execute("SELECT value FROM bot_settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+    except Exception:
+        return default
+
+def _db_set_setting(key: str, value: str) -> None:
+    try:
+        with _get_db() as conn:
+            conn.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
+            conn.commit()
+    except Exception as e:
+        logger.exception("bot_settings set error: %s", e)
+
+
+# ---- favourites CRUD ----
+
+def _db_toggle_favourite(user_id: int, product_id: str) -> bool:
+    """Добавляет или убирает из избранного. Возвращает True если добавлено."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM favourites WHERE user_id=? AND product_id=?",
+            (str(user_id), product_id)
+        ).fetchone()
+        if row:
+            conn.execute("DELETE FROM favourites WHERE user_id=? AND product_id=?",
+                         (str(user_id), product_id))
+            conn.commit()
+            return False
+        else:
+            conn.execute("INSERT INTO favourites (user_id, product_id, added_at) VALUES (?, ?, ?)",
+                         (str(user_id), product_id, now))
+            conn.commit()
+            return True
+
+def _db_is_favourite(user_id: int, product_id: str) -> bool:
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM favourites WHERE user_id=? AND product_id=?",
+            (str(user_id), product_id)
+        ).fetchone()
+    return row is not None
+
+def _db_get_favourites(user_id: int) -> List[str]:
+    """Возвращает список product_id из избранного пользователя."""
+    with _get_db() as conn:
+        rows = conn.execute(
+            "SELECT product_id FROM favourites WHERE user_id=? ORDER BY added_at DESC",
+            (str(user_id),)
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+# ---- reviews CRUD ----
+
+def _db_add_review(user: "types.User", product_id: str, product_title: str,
+                   rating: int, comment: str) -> bool:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with _get_db() as conn:
+            cursor = conn.execute(
+                """INSERT OR REPLACE INTO reviews
+                   (user_id, username, full_name, product_id, product_title, rating, comment, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(user.id), f"@{user.username}" if user.username else "",
+                 user.full_name, product_id, product_title, rating, comment, now)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.exception("review add error: %s", e)
+        return False
+
+def _db_get_reviews(product_id: str) -> List[Dict]:
+    with _get_db() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM reviews WHERE product_id=? ORDER BY created_at DESC",
+            (product_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def _db_delete_review(review_id: int) -> bool:
+    try:
+        with _get_db() as conn:
+            cursor = conn.execute("DELETE FROM reviews WHERE id=?", (review_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception:
+        return False
+
+def _db_has_review(user_id: int, product_id: str) -> bool:
+    with _get_db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM reviews WHERE user_id=? AND product_id=?",
+            (str(user_id), product_id)
+        ).fetchone()
+    return row is not None
+
+
+# ---- review_requests CRUD ----
+
+def _db_schedule_review_request(user_id: int, product_id: str) -> None:
+    """Планирует запрос отзыва через 24 часа."""
+    from datetime import timedelta
+    send_after = (datetime.now() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with _get_db() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO review_requests (user_id, product_id, send_after, sent)
+                   VALUES (?, ?, ?, 0)""",
+                (str(user_id), product_id, send_after)
+            )
+            conn.commit()
+    except Exception as e:
+        logger.exception("schedule_review_request error: %s", e)
+
+def _db_get_pending_review_requests() -> List[Dict]:
+    """Возвращает запросы отзывов которые пора отправить."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _get_db() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT * FROM review_requests
+               WHERE sent=0 AND send_after <= ?""",
+            (now,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def _db_mark_review_request_sent(request_id: int) -> None:
+    with _get_db() as conn:
+        conn.execute("UPDATE review_requests SET sent=1 WHERE id=?", (request_id,))
+        conn.commit()
+
+
+# ---- quiz_results CRUD ----
+
+def _db_save_quiz(user_id: int, age_group: str, interest: str) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _get_db() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO quiz_results (user_id, age_group, interest, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            (str(user_id), age_group, interest, now)
+        )
+        conn.commit()
+
+def _db_get_quiz(user_id: int) -> Optional[Dict]:
+    with _get_db() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM quiz_results WHERE user_id=?", (str(user_id),)
+        ).fetchone()
+    return dict(row) if row else None
 
 
 # ---- pending_orders CRUD ----
@@ -950,6 +1164,9 @@ async def grant_product_to_user(
             return False
 
         await bot.send_document(chat_id, product["file_id"])
+        asyncio.create_task(_suggest_more(chat_id, user.id, product))
+        loop2 = asyncio.get_running_loop()
+        await loop2.run_in_executor(None, _db_schedule_review_request, user.id, product["product_id"])
         return True
 
 
@@ -1021,7 +1238,7 @@ async def cmd_start(message: types.Message):
         product = next((p for p in _all_products if p["product_id"] == pid), None)
         if product:
             await message.answer(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
-            text = format_product_card(product)
+            text = await format_product_card_full(product)
             kb = product_action_kb(product, category_key=_cat_key(_to_str(product.get("category", ""))))
             preview_id = _to_str(product.get("preview_file_id"))
             if preview_id:
@@ -1278,6 +1495,13 @@ def format_product_card(product: Dict[str, Any]) -> str:
     )
 
 
+async def format_product_card_full(product: Dict[str, Any]) -> str:
+    """Карточка товара с отзывами."""
+    base = format_product_card(product)
+    reviews_text = await get_reviews_text(product["product_id"])
+    return base + reviews_text if reviews_text else base
+
+
 @dp.callback_query_handler(lambda c: c.data.startswith("item:"))
 async def cb_item(call: types.CallbackQuery):
     parts = call.data.split(":")
@@ -1296,8 +1520,14 @@ async def cb_item(call: types.CallbackQuery):
 
     await call.answer()
 
-    text = format_product_card(product)
+    text = await format_product_card_full(product)
+    # Добавляем кнопку отзывов в клавиатуру если есть отзывы
+    loop2 = asyncio.get_running_loop()
+    reviews = await loop2.run_in_executor(None, _db_get_reviews, product["product_id"])
     kb = product_action_kb(product, category_key=category_key)
+    if reviews:
+        # Добавляем кнопки удаления отзывов для автора/админа
+        pass
     preview_id = _to_str(product.get("preview_file_id"))
     chat_id = call.message.chat.id
 
@@ -2567,6 +2797,444 @@ async def adm_save_field(message: types.Message, state: FSMContext):
         await message.answer("❌ Не удалось обновить.", reply_markup=admin_main_kb())
 
 
+
+# =========================
+# АНИМИРОВАННЫЙ СТАРТ
+# =========================
+
+@dp.message_handler(commands=["setgif"], user_id=ADMIN_IDS)
+async def cmd_set_gif(message: types.Message):
+    args = message.get_args().strip().lower()
+    if args == "clear":
+        _db_set_setting("start_gif", "")
+        await message.answer("✅ Стартовая анимация удалена.")
+        return
+    await message.answer(
+        "Отправь GIF-анимацию или стикер — он будет показываться новым пользователям при /start\n\n"
+        "Чтобы удалить: /setgif clear"
+    )
+
+
+@dp.message_handler(
+    content_types=[types.ContentType.ANIMATION, types.ContentType.STICKER],
+    user_id=ADMIN_IDS
+)
+async def admin_got_animation(message: types.Message):
+    if message.animation:
+        _db_set_setting("start_gif", message.animation.file_id)
+        _db_set_setting("start_gif_kind", "gif")
+        await message.reply("Стартовая анимация сохранена!")
+    elif message.sticker:
+        _db_set_setting("start_gif", message.sticker.file_id)
+        _db_set_setting("start_gif_kind", "sticker")
+        await message.reply("Стартовый стикер сохранён!")
+
+
+# =========================
+# ИЗБРАННОЕ
+# =========================
+
+def product_action_kb_fav(product: Dict[str, Any], category_key: str,
+                           is_fav: bool) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    pid = product["product_id"]
+    price_xtr = int(product.get("price_xtr", 0) or 0)
+    price_crypto_raw = _to_str(product.get("price_crypto", ""))
+    crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
+
+    if is_free_product(product):
+        kb.add(InlineKeyboardButton("🎁 Скачать бесплатно", callback_data=f"get:{pid}"))
+    else:
+        if price_xtr > 0:
+            kb.add(InlineKeyboardButton(f"⭐ Купить за {price_xtr} Stars",
+                                         callback_data=f"paystars:{pid}"))
+        if can_buy_with_crypto(product):
+            kb.add(InlineKeyboardButton(f"💰 Купить за {price_crypto_raw} {crypto_asset}",
+                                         callback_data=f"paycrypto:{pid}"))
+    fav_text = "❤️ В избранном" if is_fav else "🤍 В избранное"
+    kb.add(InlineKeyboardButton(fav_text, callback_data=f"fav:{pid}:{category_key}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад к списку", callback_data=f"back_items:{category_key}"))
+    kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
+    return kb
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("fav:"))
+async def cb_fav_toggle(call: types.CallbackQuery):
+    parts = call.data.split(":")
+    pid = parts[1]
+    category_key = parts[2] if len(parts) > 2 else ""
+    user = call.from_user
+    loop = asyncio.get_running_loop()
+    added = await loop.run_in_executor(None, _db_toggle_favourite, user.id, pid)
+    await call.answer("❤️ Добавлено в избранное!" if added else "💔 Убрано из избранного")
+    try:
+        _all_products = await load_products()
+        product = next((p for p in _all_products if p["product_id"] == pid), None)
+        if product:
+            kb = product_action_kb_fav(product, category_key, added)
+            await call.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+
+
+@dp.callback_query_handler(lambda c: c.data == "open:favourites")
+async def cb_open_favourites(call: types.CallbackQuery):
+    await call.answer()
+    user = call.from_user
+    loop = asyncio.get_running_loop()
+    fav_ids = await loop.run_in_executor(None, _db_get_favourites, user.id)
+    if not fav_ids:
+        kb = InlineKeyboardMarkup(row_width=1)
+        kb.add(InlineKeyboardButton("📚 Каталог", callback_data="open:catalog"))
+        kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
+        try:
+            await call.message.edit_text(
+                "🤍 <b>Избранное пусто</b>\n\nДобавляй товары кнопкой 🤍 на карточке",
+                reply_markup=kb, parse_mode="HTML"
+            )
+        except Exception:
+            await call.message.answer(
+                "🤍 <b>Избранное пусто</b>", reply_markup=kb, parse_mode="HTML"
+            )
+        return
+    all_products = await load_products()
+    prod_map = {p["product_id"]: p for p in all_products}
+    await call.message.answer("❤️ <b>Избранное:</b>", parse_mode="HTML")
+    for pid in fav_ids:
+        product = prod_map.get(pid)
+        if not product:
+            continue
+        is_bought = await user_has_purchase(user.id, pid)
+        price_xtr = int(product.get("price_xtr", 0) or 0)
+        status = "✅ Куплено" if is_bought else (
+            "🎁 Бесплатно" if is_free_product(product) else f"⭐ {price_xtr} Stars"
+        )
+        kb = InlineKeyboardMarkup(row_width=2)
+        cat_key = _cat_key(_to_str(product.get("category", "")))
+        _cat_key_to_name[cat_key] = _to_str(product.get("category", ""))
+        if is_bought:
+            kb.add(InlineKeyboardButton("📥 Скачать", callback_data=f"dl:{pid}"))
+        else:
+            kb.add(InlineKeyboardButton("👁 Посмотреть", callback_data=f"item:{pid}:{cat_key}"))
+        kb.add(InlineKeyboardButton("💔 Убрать", callback_data=f"fav:{pid}:"))
+        await call.message.answer(
+            f"📄 <b>{product['title']}</b>\n{status}",
+            reply_markup=kb, parse_mode="HTML"
+        )
+
+
+# =========================
+# КВИЗ — подбор материалов
+# =========================
+
+class QuizState(StatesGroup):
+    age      = State()
+    interest = State()
+
+
+AGE_GROUPS = ["3-4 года", "4-5 лет", "5-6 лет", "6-8 лет"]
+INTERESTS  = ["Творчество", "Наука", "Логика", "Всё понемногу"]
+
+INTEREST_KEYWORDS: Dict[str, list] = {
+    "Творчество": ["детск", "задан", "разукрашк"],
+    "Наука":      ["науч", "сказк", "знайк"],
+    "Логика":     ["развивающ", "вопрос", "логик"],
+    "Всё понемногу": [],
+}
+
+
+@dp.callback_query_handler(lambda c: c.data == "quiz:start", state="*")
+async def quiz_start(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.finish()
+    await state.set_state(QuizState.age)
+    kb = InlineKeyboardMarkup(row_width=2)
+    for age in AGE_GROUPS:
+        kb.add(InlineKeyboardButton(age, callback_data=f"quiz:age:{age}"))
+    kb.add(InlineKeyboardButton("Пропустить", callback_data="quiz:skip"))
+    try:
+        await call.message.edit_text(
+            "🎯 <b>Подберём материалы!</b>\n\nСколько лет ребёнку?",
+            reply_markup=kb, parse_mode="HTML"
+        )
+    except Exception:
+        await call.message.answer(
+            "🎯 <b>Подберём материалы!</b>\n\nСколько лет ребёнку?",
+            reply_markup=kb, parse_mode="HTML"
+        )
+
+
+@dp.callback_query_handler(lambda c: c.data == "quiz:skip", state="*")
+async def quiz_skip(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.finish()
+    try:
+        await call.message.edit_text(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
+    except Exception:
+        await call.message.answer(START_TEXT, reply_markup=start_inline_kb(), parse_mode="HTML")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("quiz:age:"), state=QuizState.age)
+async def quiz_got_age(call: types.CallbackQuery, state: FSMContext):
+    age = call.data.split("quiz:age:", 1)[1]
+    await state.update_data(age=age)
+    await state.set_state(QuizState.interest)
+    kb = InlineKeyboardMarkup(row_width=1)
+    for interest in INTERESTS:
+        kb.add(InlineKeyboardButton(interest, callback_data=f"quiz:int:{interest}"))
+    await call.answer()
+    await call.message.edit_text(
+        f"Возраст: <b>{age}</b>\n\nЧто интересует больше всего?",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("quiz:int:"), state=QuizState.interest)
+async def quiz_got_interest(call: types.CallbackQuery, state: FSMContext):
+    interest = call.data.split("quiz:int:", 1)[1]
+    data = await state.get_data()
+    age = data.get("age", "")
+    await state.finish()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _db_save_quiz, call.from_user.id, age, interest)
+
+    all_products = await load_products()
+    keywords = INTEREST_KEYWORDS.get(interest, [])
+    if keywords:
+        matched = [
+            p for p in all_products
+            if any(kw in p.get("category", "").lower() or kw in p.get("title", "").lower()
+                   for kw in keywords)
+        ]
+    else:
+        matched = all_products
+
+    result = []
+    for p in matched[:8]:
+        if not await user_has_purchase(call.from_user.id, p["product_id"]):
+            result.append(p)
+            if len(result) >= 4:
+                break
+
+    if not result:
+        result = all_products[:4]
+
+    await call.answer()
+    await call.message.edit_text(
+        f"🎯 <b>Подборка для ребёнка {age}</b> — тема: {interest}\n\nНашли {len(result)} материала:",
+        parse_mode="HTML"
+    )
+    for p in result:
+        cat_key = _cat_key(_to_str(p.get("category", "")))
+        _cat_key_to_name[cat_key] = _to_str(p.get("category", ""))
+        price_xtr = int(p.get("price_xtr", 0) or 0)
+        price_str = "🎁 Бесплатно" if is_free_product(p) else f"⭐ {price_xtr} Stars"
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("👁 Посмотреть", callback_data=f"item:{p['product_id']}:{cat_key}"))
+        await call.message.answer(
+            f"📄 <b>{p['title']}</b>\n{price_str}",
+            reply_markup=kb, parse_mode="HTML"
+        )
+    back_kb = InlineKeyboardMarkup()
+    back_kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
+    await call.message.answer("Нажми на товар чтобы узнать подробнее", reply_markup=back_kb)
+
+
+# =========================
+# ОТЗЫВЫ
+# =========================
+
+class ReviewState(StatesGroup):
+    comment = State()
+
+
+async def send_review_requests():
+    """Проверяет и отправляет запросы отзывов."""
+    loop = asyncio.get_running_loop()
+    requests = await loop.run_in_executor(None, _db_get_pending_review_requests)
+    for req in requests:
+        try:
+            user_id = int(req["user_id"])
+            product_id = req["product_id"]
+            has = await loop.run_in_executor(None, _db_has_review, user_id, product_id)
+            if has:
+                await loop.run_in_executor(None, _db_mark_review_request_sent, req["id"])
+                continue
+            prod = await loop.run_in_executor(None, _db_get_product, product_id)
+            title = prod["title"] if prod else product_id
+            kb = InlineKeyboardMarkup(row_width=5)
+            for i in range(1, 6):
+                kb.insert(InlineKeyboardButton(
+                    "⭐" * i,
+                    callback_data=f"rev:rate:{product_id}:{req['id']}:{i}"
+                ))
+            kb.add(InlineKeyboardButton("Пропустить", callback_data=f"rev:skip:{req['id']}"))
+            await bot.send_message(
+                user_id,
+                f"Как вам материал <b>{title}</b>? Поставьте оценку:",
+                reply_markup=kb, parse_mode="HTML"
+            )
+            await loop.run_in_executor(None, _db_mark_review_request_sent, req["id"])
+        except Exception as e:
+            logger.warning("send_review_request error: %s", e)
+            try:
+                await loop.run_in_executor(None, _db_mark_review_request_sent, req["id"])
+            except Exception:
+                pass
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("rev:skip:"))
+async def cb_review_skip(call: types.CallbackQuery):
+    await call.answer("Хорошо!")
+    try:
+        await call.message.delete()
+    except Exception:
+        await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup())
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("rev:rate:"), state="*")
+async def cb_review_rate(call: types.CallbackQuery, state: FSMContext):
+    parts = call.data.split(":")
+    product_id = parts[2]
+    rating = int(parts[4])
+    await state.update_data(rev_product_id=product_id, rev_rating=rating)
+    await state.set_state(ReviewState.comment)
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Пропустить", callback_data=f"rev:nc:{product_id}:{rating}"))
+    await call.answer()
+    await call.message.edit_text(
+        f"Оценка: {'⭐' * rating}\n\nНапишите комментарий (или нажмите пропустить):",
+        reply_markup=kb
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("rev:nc:"), state=ReviewState.comment)
+async def cb_review_no_comment(call: types.CallbackQuery, state: FSMContext):
+    parts = call.data.split(":")
+    product_id, rating = parts[2], int(parts[3])
+    await _finalize_review(call.from_user, product_id, rating, "")
+    await state.finish()
+    await call.answer("Спасибо за оценку!")
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
+
+@dp.message_handler(state=ReviewState.comment)
+async def cb_review_comment(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    await _finalize_review(
+        message.from_user,
+        data.get("rev_product_id", ""),
+        data.get("rev_rating", 5),
+        message.text.strip()
+    )
+    await state.finish()
+    await message.answer("Спасибо за отзыв!")
+
+
+async def _finalize_review(user, product_id: str, rating: int, comment: str):
+    loop = asyncio.get_running_loop()
+    prod = await loop.run_in_executor(None, _db_get_product, product_id)
+    title = prod["title"] if prod else product_id
+    await loop.run_in_executor(None, _db_add_review, user, product_id, title, rating, comment)
+
+
+def _db_get_review_by_id(review_id: int) -> Optional[Dict]:
+    with _get_db() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
+    return dict(row) if row else None
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("rev:del:"))
+async def cb_review_delete(call: types.CallbackQuery):
+    review_id = int(call.data.split(":")[2])
+    user = call.from_user
+    loop = asyncio.get_running_loop()
+    review = await loop.run_in_executor(None, _db_get_review_by_id, review_id)
+    if not review:
+        await call.answer("Отзыв не найден.", show_alert=True)
+        return
+    if str(user.id) != review.get("user_id") and user.id not in ADMIN_IDS:
+        await call.answer("Нет прав на удаление.", show_alert=True)
+        return
+    await loop.run_in_executor(None, _db_delete_review, review_id)
+    await call.answer("Отзыв удалён.")
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+
+
+async def get_reviews_text(product_id: str) -> str:
+    """Текст с рейтингом для карточки товара."""
+    loop = asyncio.get_running_loop()
+    reviews = await loop.run_in_executor(None, _db_get_reviews, product_id)
+    if not reviews:
+        return ""
+    avg = sum(r["rating"] for r in reviews) / len(reviews)
+    lines = [f"\n{'⭐' * round(avg)} <b>{avg:.1f}</b> ({len(reviews)} отзывов)"]
+    for r in reviews[:2]:
+        name = (r.get("full_name") or "Покупатель").split()[0]
+        comment = r.get("comment", "")
+        r_stars = "⭐" * r["rating"]
+        line = f"  {r_stars} {name}"
+        if comment:
+            line += f": {comment[:50]}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+async def format_product_card_full(product: Dict[str, Any]) -> str:
+    """Карточка товара с отзывами."""
+    base = format_product_card(product)
+    reviews_text = await get_reviews_text(product["product_id"])
+    return base + reviews_text if reviews_text else base
+
+
+# =========================
+# ПОХОЖИЕ ТОВАРЫ ПОСЛЕ ПОКУПКИ
+# =========================
+
+async def _suggest_more(chat_id: int, user_id: int, product: Dict[str, Any]) -> None:
+    """После покупки предлагает товары из той же серии."""
+    try:
+        await asyncio.sleep(1)  # небольшая пауза чтобы файл пришёл первым
+        all_products = await load_products()
+        category = product.get("category", "")
+        suggestions = []
+        for p in all_products:
+            if (p.get("category") == category
+                    and p["product_id"] != product["product_id"]
+                    and not await user_has_purchase(user_id, p["product_id"])):
+                suggestions.append(p)
+                if len(suggestions) >= 3:
+                    break
+        if not suggestions:
+            return
+        kb = InlineKeyboardMarkup(row_width=1)
+        for p in suggestions:
+            cat_key = _cat_key(_to_str(p.get("category", "")))
+            _cat_key_to_name[cat_key] = _to_str(p.get("category", ""))
+            price_xtr = int(p.get("price_xtr", 0) or 0)
+            price_str = "🎁" if is_free_product(p) else f"⭐{price_xtr}"
+            kb.add(InlineKeyboardButton(
+                f"{price_str} {p['title']}",
+                callback_data=f"item:{p['product_id']}:{cat_key}"
+            ))
+        await bot.send_message(
+            chat_id,
+            "🎯 <b>Попробуйте ещё из этой серии:</b>",
+            reply_markup=kb,
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning("_suggest_more error: %s", e)
+
+
+
 # =========================
 # WEBHOOK / POLLING — автовыбор
 # =========================
@@ -2577,10 +3245,22 @@ WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}" if WEBHOOK_HOST else ""
 WEBAPP_PORT = int(os.getenv("PORT", 8080))
 
 
+async def _review_request_loop():
+    """Фоновый цикл: каждые 30 минут проверяем и отправляем запросы отзывов."""
+    while True:
+        try:
+            await send_review_requests()
+        except Exception as e:
+            logger.warning("review_request_loop error: %s", e)
+        await asyncio.sleep(1800)  # 30 минут
+
+
 async def on_startup(dp):
     init_db()
     _db_cleanup_pending_orders()
     await _setup_bot_commands()
+    # Запускаем фоновый цикл отзывов
+    asyncio.create_task(_review_request_loop())
     if WEBHOOK_URL:
         await bot.set_webhook(WEBHOOK_URL)
         logger.info("Webhook set: %s", WEBHOOK_URL)
