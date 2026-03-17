@@ -2273,10 +2273,16 @@ async def cmd_cardtest(message: types.Message):
         CARD_NUMBER[:4] + " **** **** " + CARD_NUMBER[-4:]
         if len(CARD_NUMBER) >= 8 else ("задан" if CARD_NUMBER else "НЕ ЗАДАН")
     )
+    # Показываем все env-переменные содержащие CARD для диагностики
+    import os as _os
+    card_env_keys = [k for k in _os.environ if "CARD" in k.upper()]
+    env_debug = ", ".join(card_env_keys) if card_env_keys else "нет переменных с CARD"
     lines = [
         "🔍 <b>Диагностика оплаты картой</b>\n",
-        f"CARD_NUMBER: <b>{card_num_masked}</b>",
-        f"CARD_PRICE_RUB: <b>{CARD_PRICE_RUB or 'не задан (берётся из товара)'}</b>",
+        f"CARD_NUMBER в коде: <b>{card_num_masked}</b>",
+        f"CARD_PRICE_RUB: <b>{CARD_PRICE_RUB or 'не задан'}</b>",
+        f"ENV переменные с CARD: <code>{env_debug}</code>",
+        f"Прямой os.getenv: <b>{_os.getenv('CARD_NUMBER', 'ПУСТО')[:4] + '...' if _os.getenv('CARD_NUMBER') else 'ПУСТО'}</b>",
     ]
     # Проверяем тестовый товар
     all_products = await load_products()
