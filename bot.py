@@ -55,6 +55,12 @@ CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN", "").strip()
 CRYPTO_PAY_BASE_URL = os.getenv("CRYPTO_PAY_BASE_URL", "https://pay.crypt.bot/api").strip()
 CRYPTO_PAY_DEFAULT_ASSET = os.getenv("CRYPTO_PAY_DEFAULT_ASSET", "USDT").strip().upper()
 
+# Карта РФ для ручной проверки оплаты
+# Установите в Railway: CARD_NUMBER=4100118957942506
+CARD_NUMBER = os.getenv("CARD_NUMBER", "").strip()
+# Цена в рублях (показывается пользователю при выборе оплаты картой)
+CARD_PRICE_RUB = os.getenv("CARD_PRICE_RUB", "").strip()  # например "150" — оставьте пустым если цена разная у каждого товара
+
 FREE_CATEGORY_NAME = "🎁 Бесплатные материалы"
 
 HTTP_TIMEOUT = 15
@@ -1706,8 +1712,9 @@ def payment_methods_kb(product: Dict[str, Any], category_key: str) -> InlineKeyb
             callback_data=f"paycrypto:{pid}"
         ))
 
-    # Сюда легко добавить новый метод, например:
-    # kb.add(InlineKeyboardButton("Карта РФ — ... ₽", callback_data=f"paycard:{pid}"))
+    if CARD_NUMBER:
+        card_label = f"Карта РФ — {CARD_PRICE_RUB} ₽" if CARD_PRICE_RUB else "Карта РФ (Юмани)"
+        kb.add(InlineKeyboardButton(card_label, callback_data=f"paycard:{pid}:{category_key}"))
 
     kb.add(InlineKeyboardButton("← Назад к товару", callback_data=f"back_to_item:{pid}:{category_key}"))
     return kb
@@ -3560,6 +3567,387 @@ async def quiz_got_interest(call: types.CallbackQuery, state: FSMContext):
     back_kb = InlineKeyboardMarkup()
     back_kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
     await call.message.answer("Нажмите на материал чтобы узнать подробнее", reply_markup=back_kb)
+
+# =========================
+# ОПЛАТА КАРТОЙ РФ (ручная проверка)
+# =========================
+
+class CardPayState(StatesGroup):
+    waiting_screenshot = State()
+    waiting_deny_reason = State()
+
+
+def _admin_approve_kb(user_id: int, product_id: str, order_key: str) -> InlineKeyboardMarkup:
+    """Кнопки для админа: одобрить или отклонить оплату картой."""
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton(
+            "✅ Одобрить и выдать файл",
+            callback_data=f"cardapprove:{user_id}:{product_id}:{order_key}"
+        ),
+        InlineKeyboardButton(
+            "❌ Отклонить",
+            callback_data=f"carddeny:{user_id}:{product_id}:{order_key}"
+        )
+    )
+    return kb
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("paycard:"))
+async def cb_pay_card(call: types.CallbackQuery, state: FSMContext):
+    """Пользователь выбрал оплату картой — показываем реквизиты и просим скрин."""
+    parts = call.data.split(":", 2)
+    if len(parts) < 3:
+        await call.answer("Некорректная кнопка.", show_alert=True)
+        return
+
+    pid = parts[1]
+    category_key = parts[2]
+
+    if not CARD_NUMBER:
+        await call.answer("Оплата картой временно недоступна.", show_alert=True)
+        return
+
+    _all_products = await load_products()
+    product = next((p for p in _all_products if p["product_id"] == pid), None)
+    if not product:
+        await call.answer("Материал не найден.", show_alert=True)
+        return
+
+    user = call.from_user
+    if await user_has_purchase(user.id, pid):
+        await call.answer()
+        await bot.send_document(call.message.chat.id, product["file_id"])
+        return
+
+    # Сохраняем снимок товара как pending order
+    order_key = f"card:{user.id}:{int(time.time())}"
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None, _db_save_pending_order,
+        user.id, product, "card", CARD_PRICE_RUB or "—", "RUB", order_key
+    )
+
+    # Сохраняем в FSM — понадобится когда придёт скриншот
+    await state.update_data(
+        card_pid=pid,
+        card_order_key=order_key,
+        card_category_key=category_key
+    )
+    await state.set_state(CardPayState.waiting_screenshot)
+
+    price_line = f"\n💰 Сумма: <b>{CARD_PRICE_RUB} ₽</b>" if CARD_PRICE_RUB else ""
+    card_formatted = " ".join(
+        CARD_NUMBER[i:i+4] for i in range(0, len(CARD_NUMBER), 4)
+    )
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("❌ Отменить", callback_data=f"cardcancel:{order_key}"))
+
+    await call.answer()
+    await bot.send_message(
+        call.message.chat.id,
+        f"💳 <b>Оплата картой</b>{price_line}\n\n"
+        f"Переведите на карту Юмани:\n"
+        f"<code>{card_formatted}</code>\n\n"
+        f"После оплаты отправьте скриншот подтверждения в этот чат — "
+        f"мы проверим и пришлём ваш материал.",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("cardcancel:"), state=CardPayState.waiting_screenshot)
+async def cb_card_cancel(call: types.CallbackQuery, state: FSMContext):
+    """Пользователь отменил оплату картой."""
+    order_key = call.data.split("cardcancel:", 1)[1]
+    data = await state.get_data()
+    await state.finish()
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _db_delete_pending_order, "card", order_key, call.from_user.id)
+
+    await call.answer("Отменено.")
+    try:
+        await call.message.delete()
+    except Exception:
+        await call.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup())
+
+
+@dp.message_handler(
+    content_types=[types.ContentType.PHOTO, types.ContentType.DOCUMENT],
+    state=CardPayState.waiting_screenshot
+)
+async def cb_card_screenshot(message: types.Message, state: FSMContext):
+    """Пользователь прислал скриншот — пересылаем админу с кнопками одобрения."""
+    data = await state.get_data()
+    pid = data.get("card_pid")
+    order_key = data.get("card_order_key", "")
+
+    if not pid or not order_key:
+        await state.finish()
+        await message.answer("Что-то пошло не так. Попробуйте снова через /start.")
+        return
+
+    # Получаем товар из pending_order (снимок)
+    loop = asyncio.get_running_loop()
+    pending = await loop.run_in_executor(
+        None, _db_get_pending_order, "card", order_key, message.from_user.id
+    )
+    if not pending:
+        # Fallback
+        _all_products = await load_products()
+        product = next((p for p in _all_products if p["product_id"] == pid), None)
+        product_title = product["title"] if product else pid
+    else:
+        product_title = pending.get("product_title", pid)
+
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "нет"
+    price_label = pending.get("expected_amount", "—") if pending else "—"
+    price_line = f" ({price_label} ₽)" if price_label and price_label != "—" else ""
+
+    admin_caption = (
+        f"💳 <b>Оплата картой — скриншот</b>\n\n"
+        f"📄 Товар: <b>{product_title}</b>{price_line}\n"
+        f"👤 Пользователь: {user.full_name}\n"
+        f"ID: <code>{user.id}</code>  Username: {username}\n\n"
+        f"Проверьте скриншот и подтвердите или отклоните оплату."
+    )
+
+    try:
+        if message.photo:
+            await bot.send_photo(
+                ADMIN_CHAT_ID,
+                message.photo[-1].file_id,
+                caption=admin_caption,
+                reply_markup=_admin_approve_kb(user.id, pid, order_key),
+                parse_mode="HTML"
+            )
+        else:
+            await bot.send_document(
+                ADMIN_CHAT_ID,
+                message.document.file_id,
+                caption=admin_caption,
+                reply_markup=_admin_approve_kb(user.id, pid, order_key),
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logger.exception("Не удалось переслать скриншот админу: %s", e)
+        await message.answer(
+            "Не удалось отправить скриншот на проверку. Напишите в поддержку через /help."
+        )
+        return
+
+    await state.finish()
+    await message.answer(
+        "✅ Скриншот получен. Платёж проверяется — вы получите PDF как только оплата будет подтверждена.",
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("🏠 Главная", callback_data="open:start")
+        )
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("cardapprove:"), user_id=ADMIN_IDS)
+async def cb_card_approve(call: types.CallbackQuery):
+    """Админ одобрил оплату — выдаём файл пользователю."""
+    parts = call.data.split(":")
+    if len(parts) < 4:
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    target_user_id = int(parts[1])
+    pid = parts[2]
+    order_key = ":".join(parts[3:])  # order_key может содержать ":"
+
+    loop = asyncio.get_running_loop()
+    pending = await loop.run_in_executor(
+        None, _db_get_pending_order, "card", order_key, target_user_id
+    )
+
+    if pending:
+        product = {
+            "product_id": pending["product_id"],
+            "title": pending.get("product_title", ""),
+            "file_id": pending["file_id"],
+            "price_xtr": 0,
+        }
+    else:
+        logger.warning("cardapprove: pending не найден для user=%s order=%s", target_user_id, order_key)
+        _all_products = await load_products()
+        product = next((p for p in _all_products if p["product_id"] == pid), None)
+        if not product:
+            await call.answer("Товар не найден. Проверьте вручную.", show_alert=True)
+            return
+
+    # Создаём фейковый user-объект для grant (нужны только id и имя)
+    class _FakeUser:
+        def __init__(self, uid):
+            self.id = uid
+            self.username = None
+            self.full_name = f"user_{uid}"
+
+    fake_user = _FakeUser(target_user_id)
+
+    ok = await grant_product_to_user(
+        chat_id=target_user_id,
+        user=fake_user,
+        product=product,
+        price_label="Карта РФ"
+    )
+
+    if ok:
+        # Удаляем pending
+        await loop.run_in_executor(
+            None, _db_delete_pending_order, "card", order_key, target_user_id
+        )
+        # Уведомляем пользователя
+        try:
+            await bot.send_message(
+                target_user_id,
+                "✅ <b>Оплата подтверждена!</b>\n\nВаш материал отправлен выше 👆",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+        await call.answer("✅ Одобрено, файл выдан!")
+        # Редактируем сообщение со скриншотом — убираем кнопки, добавляем статус
+        try:
+            original_caption = call.message.caption or ""
+            await call.message.edit_caption(
+                caption=original_caption + "\n\n✅ <b>ОДОБРЕНО</b>",
+                reply_markup=InlineKeyboardMarkup(),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    else:
+        await call.answer("❌ Ошибка выдачи файла. Попробуйте отправить вручную.", show_alert=True)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("carddeny:"), user_id=ADMIN_IDS)
+async def cb_card_deny(call: types.CallbackQuery, state: FSMContext):
+    """Админ нажал Отклонить — просим ввести причину."""
+    parts = call.data.split(":")
+    if len(parts) < 4:
+        await call.answer("Некорректные данные.", show_alert=True)
+        return
+
+    target_user_id = int(parts[1])
+    pid = parts[2]
+    order_key = ":".join(parts[3:])
+
+    # Сохраняем контекст в FSM — понадобится когда придёт причина
+    await state.update_data(
+        deny_user_id=target_user_id,
+        deny_pid=pid,
+        deny_order_key=order_key,
+        deny_message_id=call.message.message_id,
+        deny_caption=call.message.caption or ""
+    )
+    await state.set_state(CardPayState.waiting_deny_reason)
+    await call.answer()
+
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Пропустить (без причины)", callback_data="carddeny_skip"))
+    await bot.send_message(
+        call.message.chat.id,
+        "Напишите причину отклонения — она будет отправлена пользователю.\n"
+        "Или нажмите кнопку чтобы отклонить без объяснений:",
+        reply_markup=kb
+    )
+
+
+async def _execute_card_deny(
+    admin_chat_id: int,
+    target_user_id: int,
+    pid: str,
+    order_key: str,
+    original_message_id: int,
+    original_caption: str,
+    reason: str = ""
+) -> None:
+    """Выполняет отклонение: удаляет pending, уведомляет пользователя, обновляет скриншот."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None, _db_delete_pending_order, "card", order_key, target_user_id
+    )
+
+    if reason:
+        user_text = (
+            "❌ <b>Оплата не подтверждена.</b>\n\n"
+            f"Причина: {reason}\n\n"
+            "Если остались вопросы — напишите в поддержку: @" + AUTHOR_USERNAME
+        )
+        deny_label = f"❌ ОТКЛОНЕНО\nПричина: {reason}"
+    else:
+        user_text = (
+            "❌ <b>Оплата не подтверждена.</b>\n\n"
+            "Скриншот не прошёл проверку. Если вы уверены что оплатили — "
+            "напишите в поддержку: @" + AUTHOR_USERNAME
+        )
+        deny_label = "❌ ОТКЛОНЕНО"
+
+    try:
+        await bot.send_message(target_user_id, user_text, parse_mode="HTML")
+    except Exception:
+        pass
+
+    try:
+        await bot.edit_message_caption(
+            chat_id=admin_chat_id,
+            message_id=original_message_id,
+            caption=original_caption + f"\n\n{deny_label}",
+            reply_markup=InlineKeyboardMarkup(),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
+@dp.message_handler(user_id=ADMIN_IDS, state=CardPayState.waiting_deny_reason)
+async def cb_card_deny_reason(message: types.Message, state: FSMContext):
+    """Админ ввёл причину отклонения текстом."""
+    data = await state.get_data()
+    await state.finish()
+
+    reason = message.text.strip()
+    await _execute_card_deny(
+        admin_chat_id=message.chat.id,
+        target_user_id=data["deny_user_id"],
+        pid=data["deny_pid"],
+        order_key=data["deny_order_key"],
+        original_message_id=data["deny_message_id"],
+        original_caption=data["deny_caption"],
+        reason=reason
+    )
+    await message.answer("Отклонено, пользователь уведомлён с причиной.")
+
+
+@dp.callback_query_handler(lambda c: c.data == "carddeny_skip", user_id=ADMIN_IDS,
+                            state=CardPayState.waiting_deny_reason)
+async def cb_card_deny_skip(call: types.CallbackQuery, state: FSMContext):
+    """Админ пропустил ввод причины."""
+    data = await state.get_data()
+    await state.finish()
+    await call.answer()
+
+    await _execute_card_deny(
+        admin_chat_id=call.message.chat.id,
+        target_user_id=data["deny_user_id"],
+        pid=data["deny_pid"],
+        order_key=data["deny_order_key"],
+        original_message_id=data["deny_message_id"],
+        original_caption=data["deny_caption"],
+        reason=""
+    )
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await bot.send_message(call.message.chat.id, "Отклонено без причины, пользователь уведомлён.")
+
 
 
 # =========================
