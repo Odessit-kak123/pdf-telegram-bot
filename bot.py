@@ -1960,6 +1960,23 @@ def admin_confirm_kb() -> InlineKeyboardMarkup:
     return kb
 
 
+def cancel_kb() -> InlineKeyboardMarkup:
+    """Кнопка отмены — добавляется к каждому шагу добавления товара."""
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("❌ Отменить добавление", callback_data="adm:cancel"))
+    return kb
+
+
+def admin_category_kb(categories: list) -> InlineKeyboardMarkup:
+    """Кнопки с существующими категориями + новая."""
+    kb = InlineKeyboardMarkup(row_width=1)
+    for cat in categories:
+        kb.add(InlineKeyboardButton(cat, callback_data=f"adm:cat:{cat}"))
+    kb.add(InlineKeyboardButton("➕ Новая категория", callback_data="adm:cat:__new__"))
+    kb.add(InlineKeyboardButton("❌ Отмена", callback_data="adm:cancel"))
+    return kb
+
+
 def _gen_product_id() -> str:
     import uuid
     return "p" + uuid.uuid4().hex[:8]
@@ -2109,8 +2126,8 @@ async def adm_add_start(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(AddProduct.waiting_pdf)
     await call.message.answer(
         "➕ <b>Добавление товара</b>\n\n"
-        "Шаг 1/7: Отправь <b>PDF-файл</b> товара 📄\n\n"
-        "Для отмены: /cancel",
+        "Шаг 1/7: Отправь <b>PDF-файл</b> товара 📄",
+        reply_markup=cancel_kb(),
         parse_mode="HTML"
     )
 
@@ -2143,6 +2160,7 @@ async def adm_got_pdf(message: types.Message, state: FSMContext):
         "✅ PDF получен!\n\n"
         "Шаг 2/7: Отправь <b>фото-превью</b> 🖼\n"
         "или напиши <b>нет</b> чтобы пропустить",
+        reply_markup=cancel_kb(),
         parse_mode="HTML"
     )
 
@@ -2156,7 +2174,7 @@ async def adm_got_preview(message: types.Message, state: FSMContext):
     preview_file_id = message.photo[-1].file_id if message.photo else ""
     await state.update_data(preview_file_id=preview_file_id)
     await state.set_state(AddProduct.waiting_title)
-    await message.answer("Шаг 3/7: Введи <b>название</b> товара", parse_mode="HTML")
+    await message.answer("Шаг 3/7: Введи <b>название</b> товара", reply_markup=cancel_kb(), parse_mode="HTML")
 
 
 @dp.message_handler(user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_title)
@@ -2169,6 +2187,7 @@ async def adm_got_title(message: types.Message, state: FSMContext):
     await state.set_state(AddProduct.waiting_desc)
     await message.answer(
         "Шаг 4/7: Введи <b>описание</b> товара\n(или <b>нет</b> для пропуска)",
+        reply_markup=cancel_kb(),
         parse_mode="HTML"
     )
 
@@ -2178,22 +2197,66 @@ async def adm_got_desc(message: types.Message, state: FSMContext):
     desc = "" if message.text.strip().lower() == "нет" else message.text.strip()
     await state.update_data(description=desc)
     await state.set_state(AddProduct.waiting_category)
+    await _send_category_choice(message.chat.id)
+
+
+async def _send_category_choice(chat_id: int, text_prefix: str = "Шаг 5/7: Выбери <b>категорию</b>") -> None:
+    """Отправляет кнопки с существующими категориями."""
     loop = asyncio.get_running_loop()
     products = await loop.run_in_executor(None, _db_get_all_products, False)
     cats = sorted({p.get("category", "") for p in products if p.get("category")})
-    cats_text = "\n".join(f"• {c}" for c in cats) if cats else "—"
-    await message.answer(
-        f"Шаг 5/7: Введи <b>категорию</b>\n\nСуществующие:\n{cats_text}",
+    if cats:
+        await bot.send_message(
+            chat_id,
+            f"{text_prefix}\n\nНажми на существующую или создай новую:",
+            reply_markup=admin_category_kb(cats),
+            parse_mode="HTML"
+        )
+    else:
+        await bot.send_message(
+            chat_id,
+            f"{text_prefix}\n\nВведи название новой категории:",
+            parse_mode="HTML"
+        )
+
+
+# Выбор существующей категории через кнопку
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:cat:") and not c.data.startswith("adm:cat:__new__"),
+                            user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_category)
+async def adm_pick_category(call: types.CallbackQuery, state: FSMContext):
+    category = call.data.split("adm:cat:", 1)[1]
+    await call.answer()
+    await state.update_data(category=category)
+    await state.set_state(AddProduct.waiting_price_xtr)
+    await call.message.answer(
+        f"✅ Категория: <b>{category}</b>\n\n"
+        "Шаг 6/7: Цена в <b>Stars</b> (целое число, 0 = бесплатно)",
+        reply_markup=cancel_kb(),
         parse_mode="HTML"
     )
 
 
+# Пользователь хочет создать новую категорию
+@dp.callback_query_handler(lambda c: c.data == "adm:cat:__new__",
+                            user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_category)
+async def adm_new_category_prompt(call: types.CallbackQuery):
+    await call.answer()
+    await call.message.answer("Введи название <b>новой категории</b>:", reply_markup=cancel_kb(), parse_mode="HTML")
+
+
+# Ввод новой категории текстом
 @dp.message_handler(user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_category)
 async def adm_got_category(message: types.Message, state: FSMContext):
-    await state.update_data(category=message.text.strip())
+    category = message.text.strip()
+    if len(category) < 2:
+        await message.answer("⚠️ Слишком короткое название категории.")
+        return
+    await state.update_data(category=category)
     await state.set_state(AddProduct.waiting_price_xtr)
     await message.answer(
+        f"✅ Новая категория: <b>{category}</b>\n\n"
         "Шаг 6/7: Цена в <b>Stars</b> (целое число, 0 = бесплатно)",
+        reply_markup=cancel_kb(),
         parse_mode="HTML"
     )
 
@@ -2213,6 +2276,7 @@ async def adm_got_price_xtr(message: types.Message, state: FSMContext):
         f"Шаг 7/7: Цена в <b>крипте</b> (например <code>1.5</code>)\n"
         f"Валюта по умолчанию: {CRYPTO_PAY_DEFAULT_ASSET}\n"
         "Или напиши <b>нет</b>",
+        reply_markup=cancel_kb(),
         parse_mode="HTML"
     )
 
@@ -2317,13 +2381,51 @@ async def adm_edit_field(call: types.CallbackQuery, state: FSMContext):
     prompts = {
         "title": "Введи новое <b>название</b>:",
         "desc": "Введи новое <b>описание</b> (или <b>нет</b> для пустого):",
-        "category": "Введи новую <b>категорию</b>:",
+        "category": None,  # обрабатывается отдельно
         "price_xtr": "Введи новую цену в <b>Stars</b> (целое число):",
         "price_crypto": "Введи новую цену в <b>крипте</b> или <b>нет</b>:",
         "file_id": "Отправь новый <b>PDF-файл</b>:",
         "preview_file_id": "Отправь новое <b>фото-превью</b> или напиши <b>нет</b>:",
     }
-    await call.message.answer(prompts.get(field, "Введи новое значение:"), parse_mode="HTML")
+    if field == "category":
+        await _send_category_choice(call.message.chat.id, "Выбери <b>новую категорию</b>")
+    else:
+        await call.message.answer(prompts.get(field, "Введи новое значение:"), parse_mode="HTML")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:cat:") and not c.data.startswith("adm:cat:__new__"),
+                            user_id=[ADMIN_CHAT_ID], state=EditProduct.waiting_value)
+async def adm_edit_pick_category(call: types.CallbackQuery, state: FSMContext):
+    """Выбор существующей категории при редактировании."""
+    data = await state.get_data()
+    if data.get("editing_field") != "category":
+        await call.answer()
+        return
+    category = call.data.split("adm:cat:", 1)[1]
+    await call.answer()
+    pid = data.get("editing_product_id")
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(None, _db_update_product, pid, {"category": category})
+    global _products_cache
+    _products_cache = (0.0, [])
+    await state.finish()
+    if ok:
+        prod = await loop.run_in_executor(None, _db_get_product, pid)
+        await call.message.answer(
+            f"✅ Категория обновлена: <b>{category}</b>\n\n{_format_admin_card(prod)}",
+            reply_markup=admin_edit_kb(pid),
+            parse_mode="HTML"
+        )
+    else:
+        await call.message.answer("❌ Не удалось обновить.", reply_markup=admin_main_kb())
+
+
+@dp.callback_query_handler(lambda c: c.data == "adm:cat:__new__",
+                            user_id=[ADMIN_CHAT_ID], state=EditProduct.waiting_value)
+async def adm_edit_new_category_prompt(call: types.CallbackQuery):
+    """Запрос ввода новой категории при редактировании."""
+    await call.answer()
+    await call.message.answer("Введи название <b>новой категории</b>:", parse_mode="HTML")
 
 
 @dp.message_handler(
