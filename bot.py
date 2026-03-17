@@ -837,21 +837,28 @@ def is_free_product(p: Dict[str, Any]) -> bool:
     return price_xtr == 0 and crypto_amount is None
 
 
-_CRYPTO_AMOUNT_RE = re.compile(r"^\d+(\.\d+)?$")
+_CRYPTO_AMOUNT_RE = re.compile(r"^\d+([.,]\d+)?$")
+
+
+
+def _clean_crypto_input(raw: str) -> str:
+    """Нормализует ввод суммы: убирает пробелы, заменяет запятую на точку."""
+    return raw.strip().replace(" ", "").replace(",", ".")
 
 
 def parse_crypto_amount(product: Dict[str, Any]) -> Optional[Decimal]:
     raw = _to_str(product.get("price_crypto", ""))
     if not raw:
         return None
-    if not _CRYPTO_AMOUNT_RE.match(raw):
+    cleaned = _clean_crypto_input(raw)
+    if not _CRYPTO_AMOUNT_RE.match(cleaned):
         logger.warning(
             "Невалидный формат price_crypto для товара %s: %r",
             product.get("product_id"), raw
         )
         return None
     try:
-        amount = Decimal(raw)
+        amount = Decimal(cleaned)
         if amount <= 0:
             return None
         return amount
@@ -907,23 +914,40 @@ def categories_keyboard(categories: List[str]) -> InlineKeyboardMarkup:
     return kb
 
 
+def _product_btn_label(p: Dict[str, Any]) -> str:
+    """
+    Формирует текст кнопки товара в списке.
+    Цена — в скобках справа, эмодзи — только один (из названия или ценовой).
+    Если название уже начинается с эмодзи — не добавляем второй.
+    """
+    title = p["title"]
+    price_xtr = int(p.get("price_xtr", 0) or 0)
+    crypto_amount = parse_crypto_amount(p)
+
+    if is_free_product(p):
+        price_tag = "бесплатно"
+    elif price_xtr > 0 and crypto_amount is not None:
+        price_tag = f"{price_xtr} ⭐ / {crypto_amount} {_to_str(p.get('crypto_asset', 'USDT')).upper()}"
+    elif price_xtr > 0:
+        price_tag = f"{price_xtr} ⭐"
+    elif crypto_amount is not None:
+        price_tag = f"{crypto_amount} {_to_str(p.get('crypto_asset', 'USDT')).upper()}"
+    else:
+        price_tag = "уточните цену"
+
+    return f"{title}  ({price_tag})"
+
+
 def products_keyboard(products: List[Dict[str, Any]], category_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
     for p in products:
-        if is_free_product(p):
-            emoji = "🎁"
-        elif int(p.get("price_xtr", 0) or 0) > 0:
-            emoji = "⭐"
-        else:
-            emoji = "💰"
-        btn_text = f"{emoji} {p['title']}"
         kb.add(
             InlineKeyboardButton(
-                text=btn_text,
+                text=_product_btn_label(p),
                 callback_data=f"item:{p['product_id']}:{category_key}"
             )
         )
-    kb.add(InlineKeyboardButton("🔙 К категориям", callback_data="open:catalog"))
+    kb.add(InlineKeyboardButton("← К категориям", callback_data="open:catalog"))
     kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
     return kb
 
@@ -1154,12 +1178,12 @@ async def notify_admin_purchase(
 
 START_TEXT = (
     "👋 <b>Привет!</b>\n\n"
-    "Здесь собраны развивающие PDF-материалы для детей 🎨📚\n\n"
+    "Здесь собраны развивающие PDF-материалы для детей.\n\n"
     "🎨 Разукрашки и творческие задания\n"
     "📖 Обучающие и научные сказки\n"
     "🧠 Развивающие игры и вопросы\n"
     "🎁 Бесплатные материалы\n\n"
-    "Выберите раздел 👇"
+    "Выберите раздел:"
 )
 
 
@@ -1171,10 +1195,10 @@ def start_inline_kb() -> InlineKeyboardMarkup:
     )
     kb.add(
         InlineKeyboardButton("❤️ Избранное", callback_data="open:favourites"),
-        InlineKeyboardButton("🎯 Подобрать", callback_data="quiz:start"),
+        InlineKeyboardButton("🎯 Подобрать материал", callback_data="quiz:start"),
     )
     kb.add(
-        InlineKeyboardButton("✉️ Поддержка", url=f"https://t.me/{AUTHOR_USERNAME}")
+        InlineKeyboardButton("✉️ Написать в поддержку", url=f"https://t.me/{AUTHOR_USERNAME}")
     )
     return kb
 
@@ -1253,7 +1277,7 @@ async def send_my_purchases(chat_id: int, user: types.User):
             unique_rows.append(r)
 
     # Строим ONE сообщение со всем списком + inline кнопками
-    lines = ["📂 <b>Ваши покупки:</b>\n"]
+    lines = ["<b>Ваши покупки</b>\n"]
     kb = InlineKeyboardMarkup(row_width=1)
 
     for r in unique_rows:
@@ -1261,9 +1285,9 @@ async def send_my_purchases(chat_id: int, user: types.User):
         title = _to_str(r.get("product_title")) or prod_map.get(pid, {}).get("title", "PDF")
         price_from_row = _to_str(r.get("price_label") or r.get("price_xtr"))
         is_free_row = (price_from_row == "" or price_from_row == "0")
-        emoji = "🎁" if is_free_row else "⭐"
-        lines.append(f"{emoji} {title}")
-        kb.add(InlineKeyboardButton(f"📥 Скачать: {title[:30]}", callback_data=f"dl:{pid}"))
+        price_hint = "бесплатно" if is_free_row else price_from_row
+        lines.append(f"• {title}  <i>({price_hint})</i>")
+        kb.add(InlineKeyboardButton(f"📥 {title[:32]}", callback_data=f"dl:{pid}"))
 
     kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
 
@@ -1304,7 +1328,7 @@ async def send_favourites(chat_id: int, user: types.User, edit_message: Optional
     all_products = await load_products()
     prod_map = {p["product_id"]: p for p in all_products}
 
-    lines = ["❤️ <b>Избранное:</b>\n"]
+    lines = ["<b>Избранное</b>\n"]
     kb = InlineKeyboardMarkup(row_width=1)
 
     for pid in fav_ids:
@@ -1320,18 +1344,21 @@ async def send_favourites(chat_id: int, user: types.User, edit_message: Optional
         else:
             status = f"⭐{price_xtr}"
 
-        lines.append(f"{status} {product['title']}")
+        price_xtr_fav = int(product.get("price_xtr", 0) or 0)
+        price_hint_fav = "бесплатно" if is_free_product(product) else f"{price_xtr_fav} ⭐"
+        bought_hint = " ✓" if is_bought else ""
+        lines.append(f"• {product['title']}  <i>({price_hint_fav}{bought_hint})</i>")
         cat_key = _cat_key(_to_str(product.get("category", "")))
         _cat_key_to_name[cat_key] = _to_str(product.get("category", ""))
 
         if is_bought:
             kb.add(InlineKeyboardButton(
-                f"📥 {product['title'][:28]}",
+                f"📥 Скачать: {product['title'][:30]}",
                 callback_data=f"dl:{pid}"
             ))
         else:
             kb.add(InlineKeyboardButton(
-                f"👁 {product['title'][:28]}",
+                _product_btn_label(product),
                 callback_data=f"item:{pid}:{cat_key}"
             ))
 
@@ -1451,21 +1478,21 @@ def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeybo
     crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
 
     if is_free_product(product):
-        kb.add(InlineKeyboardButton("🎁 Скачать бесплатно", callback_data=f"get:{pid}"))
+        kb.add(InlineKeyboardButton("Скачать бесплатно 🎁", callback_data=f"get:{pid}"))
     else:
         if price_xtr > 0:
             kb.add(InlineKeyboardButton(
-                f"⭐ Купить за {price_xtr} Stars",
+                f"Купить за {price_xtr} Stars ⭐",
                 callback_data=f"paystars:{pid}"
             ))
         if can_buy_with_crypto(product):
             kb.add(InlineKeyboardButton(
-                f"💰 Купить за {price_crypto_raw} {crypto_asset}",
+                f"Купить за {price_crypto_raw} {crypto_asset}",
                 callback_data=f"paycrypto:{pid}"
             ))
 
-    kb.add(InlineKeyboardButton("❤️ В избранное", callback_data=f"fav:toggle:{pid}:{category_key}"))
-    kb.add(InlineKeyboardButton("⬅️ Назад к списку", callback_data=f"back_items:{category_key}"))
+    kb.add(InlineKeyboardButton("В избранное ❤️", callback_data=f"fav:toggle:{pid}:{category_key}"))
+    kb.add(InlineKeyboardButton("← Назад к списку", callback_data=f"back_items:{category_key}"))
     kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
     return kb
 
@@ -1482,11 +1509,11 @@ def _format_product_card(product: Dict[str, Any]) -> str:
     tags = _to_str(product.get("tags", ""))
 
     if is_free_product(product):
-        price_line = "🎁 <b>Бесплатно</b>"
+        price_line = "<b>Бесплатно</b> 🎁"
     else:
         parts = []
         if price_xtr > 0:
-            parts.append(f"⭐ <b>{price_xtr} Stars</b>")
+            parts.append(f"<b>{price_xtr} Stars</b> ⭐")
         if can_buy_with_crypto(product) and crypto_amount is not None:
             parts.append(f"💰 <b>{crypto_amount} {crypto_asset}</b>")
         price_line = "  |  ".join(parts) if parts else "💳 Уточните цену"
@@ -1510,10 +1537,10 @@ def _format_product_card(product: Dict[str, Any]) -> str:
         tags_line = ""
 
     return (
-        f"📄 <b>{title}</b>{cat_line}{age_line}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>{title}</b>{cat_line}{age_line}\n"
+        f"\n"
         f"{desc}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"\n"
         f"{price_line}{tags_line}"
     )
 
@@ -2164,7 +2191,7 @@ def admin_edit_kb(product_id: str) -> InlineKeyboardMarkup:
     ]
     for label, field in fields:
         kb.add(InlineKeyboardButton(label, callback_data=f"adm:ef:{product_id}:{field}"))
-    kb.add(InlineKeyboardButton("⬅️ Назад к списку", callback_data="adm:list"))
+    kb.add(InlineKeyboardButton("← К списку", callback_data="adm:list"))
     return kb
 
 
@@ -2561,64 +2588,215 @@ async def adm_got_price_crypto(message: types.Message, state: FSMContext):
     if text.lower() == "нет":
         await state.update_data(price_crypto="", crypto_asset="")
     else:
-        test_prod = {"price_crypto": text, "product_id": "test"}
+        # Нормализуем: убираем пробелы, заменяем запятую
+        normalized = text.replace(" ", "").replace(",", ".")
+        test_prod = {"price_crypto": normalized, "product_id": "test"}
         if parse_crypto_amount(test_prod) is None:
             await message.answer(
-                "⚠️ Неверный формат. Пример: <code>1.5</code> или напиши <b>нет</b>",
+                "⚠️ Неверный формат. Введи число, например: <code>0.2</code> или <code>1.5</code>\n"
+                "Или напиши <b>нет</b>",
                 parse_mode="HTML"
             )
             return
-        await state.update_data(price_crypto=text, crypto_asset=CRYPTO_PAY_DEFAULT_ASSET)
+        await state.update_data(price_crypto=normalized, crypto_asset=CRYPTO_PAY_DEFAULT_ASSET)
 
     await state.set_state(AddProduct.waiting_age)
-    await message.answer(
+    await _send_age_choice(message.chat.id)
+
+
+# ---- Вспомогательные клавиатуры для возраста и тегов ----
+
+# Предустановленные возрастные диапазоны
+_AGE_PRESETS = ["3-4", "4-5", "5-6", "6-8", "3-6", "4-8"]
+
+# Предустановленные теги (совпадают с INTEREST_TAGS в квизе)
+_TAG_PRESETS = ["творчество", "наука", "логика"]
+
+
+def admin_age_kb(selected: list = None) -> InlineKeyboardMarkup:
+    """Клавиатура выбора возраста с пресетами + кнопка ввода вручную."""
+    selected = selected or []
+    kb = InlineKeyboardMarkup(row_width=3)
+    for age in _AGE_PRESETS:
+        tick = "✅ " if age in selected else ""
+        kb.insert(InlineKeyboardButton(
+            f"{tick}{age}",
+            callback_data=f"adm:age:{age}"
+        ))
+    kb.add(InlineKeyboardButton("✏️ Ввести вручную", callback_data="adm:age:__custom__"))
+    kb.add(InlineKeyboardButton("➡️ Пропустить", callback_data="adm:age:__skip__"))
+    kb.add(InlineKeyboardButton("❌ Отмена", callback_data="adm:cancel"))
+    return kb
+
+
+def admin_tags_kb(selected: list = None) -> InlineKeyboardMarkup:
+    """Клавиатура выбора тегов — можно выбрать несколько + подтвердить."""
+    selected = selected or []
+    kb = InlineKeyboardMarkup(row_width=1)
+    for tag in _TAG_PRESETS:
+        tick = "✅ " if tag in selected else "◻️ "
+        kb.add(InlineKeyboardButton(
+            f"{tick}{tag}",
+            callback_data=f"adm:tag:{tag}"
+        ))
+    kb.add(InlineKeyboardButton("✏️ Добавить свой тег", callback_data="adm:tag:__custom__"))
+    if selected:
+        kb.add(InlineKeyboardButton(
+            f"✔️ Готово ({', '.join(selected)})",
+            callback_data="adm:tag:__done__"
+        ))
+    else:
+        kb.add(InlineKeyboardButton("➡️ Пропустить (без тегов)", callback_data="adm:tag:__done__"))
+    kb.add(InlineKeyboardButton("❌ Отмена", callback_data="adm:cancel"))
+    return kb
+
+
+async def _send_age_choice(chat_id: int) -> None:
+    await bot.send_message(
+        chat_id,
         "Шаг 8/9: Для какого <b>возраста</b>?\n\n"
-        "Напиши диапазон, например: <code>3-6</code> или <code>4-5</code>\n"
-        "Или напиши <b>нет</b> если не важно",
-        reply_markup=cancel_kb(),
+        "Выбери готовый диапазон или введи свой:",
+        reply_markup=admin_age_kb(),
         parse_mode="HTML"
     )
 
 
+async def _send_tags_choice(chat_id: int, selected: list = None) -> None:
+    selected = selected or []
+    await bot.send_message(
+        chat_id,
+        "Шаг 9/9: Выбери <b>теги</b> — по ним квиз подбирает материалы.\n\n"
+        "Можно выбрать несколько:",
+        reply_markup=admin_tags_kb(selected),
+        parse_mode="HTML"
+    )
+
+
+# ---- Обработчики выбора возраста ----
+
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:age:"), user_id=ADMIN_IDS,
+                            state=AddProduct.waiting_age)
+async def adm_age_btn(call: types.CallbackQuery, state: FSMContext):
+    value = call.data.split("adm:age:", 1)[1]
+    await call.answer()
+
+    if value == "__skip__":
+        await state.update_data(age_range="")
+        await state.set_state(AddProduct.waiting_tags)
+        data = await state.get_data()
+        await _send_tags_choice(call.message.chat.id, data.get("_selected_tags", []))
+        return
+
+    if value == "__custom__":
+        await call.message.answer(
+            "Введи диапазон вручную, например: <code>3-6</code> или <code>5</code>",
+            reply_markup=cancel_kb(),
+            parse_mode="HTML"
+        )
+        return
+
+    # Выбран пресет
+    await state.update_data(age_range=value)
+    await state.set_state(AddProduct.waiting_tags)
+    data = await state.get_data()
+    await call.message.answer(
+        f"✅ Возраст: <b>{value} лет</b>",
+        parse_mode="HTML"
+    )
+    await _send_tags_choice(call.message.chat.id, data.get("_selected_tags", []))
+
+
 @dp.message_handler(user_id=ADMIN_IDS, state=AddProduct.waiting_age)
 async def adm_got_age(message: types.Message, state: FSMContext):
+    """Ручной ввод возраста."""
     text = message.text.strip()
-    if text.lower() == "нет":
+    if text.lower() in ("нет", "no", "-"):
         await state.update_data(age_range="")
     else:
         age_min, age_max = _parse_age_range(text)
         if age_min == 0 and age_max == 99:
             await message.answer(
-                "⚠️ Не распознал возраст. Напиши например <code>3-6</code> или <b>нет</b>",
+                "⚠️ Не распознал. Напиши например <code>3-6</code> или нажми кнопку выше",
                 parse_mode="HTML"
             )
             return
         await state.update_data(age_range=text)
+        await message.answer(f"✅ Возраст: <b>{text} лет</b>", parse_mode="HTML")
 
     await state.set_state(AddProduct.waiting_tags)
-    await message.answer(
-        "Шаг 9/9: Теги — <b>интересы</b> (через запятую)\n\n"
-        "Это то, по чему квиз будет подбирать материал.\n\n"
-        "<b>Доступные теги:</b>\n"
-        "• <code>творчество</code> — разукрашки, задания\n"
-        "• <code>наука</code> — познавательные сказки\n"
-        "• <code>логика</code> — развивающие игры, вопросы\n\n"
-        "Пример: <code>творчество, логика</code>\n"
-        "Или напиши <b>нет</b>",
-        reply_markup=cancel_kb(),
-        parse_mode="HTML"
-    )
+    data = await state.get_data()
+    await _send_tags_choice(message.chat.id, data.get("_selected_tags", []))
+
+
+# ---- Обработчики выбора тегов (мультивыбор) ----
+
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:tag:"), user_id=ADMIN_IDS,
+                            state=AddProduct.waiting_tags)
+async def adm_tag_btn(call: types.CallbackQuery, state: FSMContext):
+    value = call.data.split("adm:tag:", 1)[1]
+    data = await state.get_data()
+    selected = list(data.get("_selected_tags", []))
+    await call.answer()
+
+    if value == "__custom__":
+        await call.message.answer(
+            "Введи свой тег (одно слово или фраза):",
+            reply_markup=cancel_kb()
+        )
+        return
+
+    if value == "__done__":
+        # Завершаем выбор тегов
+        await state.update_data(tags=",".join(selected))
+        await _show_add_confirm(call.message, state)
+        return
+
+    # Переключаем тег в выбранных
+    if value in selected:
+        selected.remove(value)
+    else:
+        selected.append(value)
+
+    await state.update_data(_selected_tags=selected)
+
+    # Редактируем клавиатуру на месте
+    try:
+        await call.message.edit_reply_markup(reply_markup=admin_tags_kb(selected))
+    except Exception:
+        pass
 
 
 @dp.message_handler(user_id=ADMIN_IDS, state=AddProduct.waiting_tags)
 async def adm_got_tags(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if text.lower() == "нет":
+    """Ручной ввод тега или завершение через текст."""
+    text = message.text.strip().lower()
+    data = await state.get_data()
+    selected = list(data.get("_selected_tags", []))
+
+    if text in ("нет", "no", "-", ""):
+        # Пропустить теги
         await state.update_data(tags="")
     else:
+        # Добавляем введённый тег к уже выбранным
         normalized = _normalize_tags(text)
-        await state.update_data(tags=normalized)
+        for tag in normalized.split(","):
+            tag = tag.strip()
+            if tag and tag not in selected:
+                selected.append(tag)
+        await state.update_data(_selected_tags=selected, tags=",".join(selected))
+        await message.answer(
+            f"✅ Тег добавлен. Выбрано: <b>{', '.join(selected)}</b>\n\n"
+            "Нажми <b>Готово</b> или добавь ещё:",
+            reply_markup=admin_tags_kb(selected),
+            parse_mode="HTML"
+        )
+        return
 
+    await _show_add_confirm(message, state)
+
+
+async def _show_add_confirm(msg_or_call, state: FSMContext) -> None:
+    """Показывает итоговую карточку товара перед добавлением."""
     data = await state.get_data()
     product_id = _gen_product_id()
     await state.update_data(product_id=product_id)
@@ -2651,15 +2829,25 @@ async def adm_got_tags(message: types.Message, state: FSMContext):
         f"Добавить товар?"
     )
     await state.set_state(AddProduct.confirm)
-    if data.get("preview_file_id"):
-        await message.answer_photo(
-            data["preview_file_id"],
+
+    # msg_or_call может быть Message или CallbackQuery.message
+    chat_id = msg_or_call.chat.id if hasattr(msg_or_call, 'chat') else msg_or_call.message.chat.id
+    preview_id = data.get("preview_file_id")
+    if preview_id:
+        await bot.send_photo(
+            chat_id,
+            preview_id,
             caption=preview_text,
             reply_markup=admin_confirm_kb(),
             parse_mode="HTML"
         )
     else:
-        await message.answer(preview_text, reply_markup=admin_confirm_kb(), parse_mode="HTML")
+        await bot.send_message(
+            chat_id,
+            preview_text,
+            reply_markup=admin_confirm_kb(),
+            parse_mode="HTML"
+        )
 
 
 @dp.callback_query_handler(lambda c: c.data == "adm:confirm", user_id=ADMIN_IDS, state=AddProduct.confirm)
@@ -2738,6 +2926,35 @@ async def adm_edit_field(call: types.CallbackQuery, state: FSMContext):
     }
     if field == "category":
         await _send_category_choice(call.message.chat.id, "Выбери <b>новую категорию</b>")
+    elif field == "age_range":
+        # Показываем кнопки возраста, сохраняем текущее значение как уже выбранное
+        loop = asyncio.get_running_loop()
+        prod = await loop.run_in_executor(None, _db_get_product, pid)
+        cur_age = ""
+        if prod:
+            a_min = int(prod.get("age_min", 0) or 0)
+            a_max = int(prod.get("age_max", 99) or 99)
+            if a_min > 0 or a_max < 99:
+                cur_age = f"{a_min}-{a_max}"
+        age_label = cur_age if cur_age else "не задан"
+        await call.message.answer(
+            "Текущий возраст: <b>" + age_label + "</b>\n\nВыбери новый:",
+            reply_markup=admin_age_kb([cur_age] if cur_age else []),
+            parse_mode="HTML"
+        )
+    elif field == "tags":
+        # Показываем кнопки тегов с текущим выбором
+        loop = asyncio.get_running_loop()
+        prod = await loop.run_in_executor(None, _db_get_product, pid)
+        cur_tags = []
+        if prod and prod.get("tags"):
+            cur_tags = [t.strip() for t in prod["tags"].split(",") if t.strip()]
+        await state.update_data(_selected_tags=cur_tags)
+        await call.message.answer(
+            "Текущие теги: <b>" + (", ".join(cur_tags) or "не заданы") + "</b>\n\nВыбери теги:",
+            reply_markup=admin_tags_kb(cur_tags),
+            parse_mode="HTML"
+        )
     else:
         await call.message.answer(prompts.get(field, "Введи новое значение:"), parse_mode="HTML")
 
@@ -2777,6 +2994,90 @@ async def adm_edit_pick_category(call: types.CallbackQuery, state: FSMContext):
 async def adm_edit_new_category_prompt(call: types.CallbackQuery):
     await call.answer()
     await call.message.answer("Введи название <b>новой категории</b>:", parse_mode="HTML")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:age:"),
+                            user_id=ADMIN_IDS, state=EditProduct.waiting_value)
+async def adm_edit_age_btn(call: types.CallbackQuery, state: FSMContext):
+    """Выбор возраста кнопкой при редактировании."""
+    value = call.data.split("adm:age:", 1)[1]
+    data = await state.get_data()
+    pid = data.get("editing_product_id")
+    await call.answer()
+
+    if value == "__custom__":
+        await call.message.answer(
+            "Введи диапазон вручную, например: <code>3-6</code>",
+            reply_markup=cancel_kb(), parse_mode="HTML"
+        )
+        return
+
+    if value == "__skip__":
+        update = {"age_min": 0, "age_max": 99}
+    else:
+        age_min, age_max = _parse_age_range(value)
+        update = {"age_min": age_min, "age_max": age_max}
+
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(None, _db_update_product, pid, update)
+    global _products_cache
+    _products_cache = (0.0, [])
+    await state.finish()
+    if ok:
+        prod = await loop.run_in_executor(None, _db_get_product, pid)
+        age_str = f"{update.get('age_min', 0)}–{update.get('age_max', 99)} лет" if value != "__skip__" else "не задан"
+        await call.message.answer(
+            f"✅ Возраст обновлён: <b>{age_str}</b>\n\n" + _format_admin_card(prod),
+            reply_markup=admin_edit_kb(pid), parse_mode="HTML"
+        )
+    else:
+        await call.message.answer("❌ Не удалось обновить.", reply_markup=admin_main_kb())
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:tag:"),
+                            user_id=ADMIN_IDS, state=EditProduct.waiting_value)
+async def adm_edit_tag_btn(call: types.CallbackQuery, state: FSMContext):
+    """Выбор тегов кнопками при редактировании."""
+    value = call.data.split("adm:tag:", 1)[1]
+    data = await state.get_data()
+    pid = data.get("editing_product_id")
+    selected = list(data.get("_selected_tags", []))
+    await call.answer()
+
+    if value == "__custom__":
+        await call.message.answer(
+            "Введи свой тег:", reply_markup=cancel_kb()
+        )
+        return
+
+    if value == "__done__":
+        # Сохраняем
+        new_tags = ",".join(selected)
+        loop = asyncio.get_running_loop()
+        ok = await loop.run_in_executor(None, _db_update_product, pid, {"tags": new_tags})
+        global _products_cache
+        _products_cache = (0.0, [])
+        await state.finish()
+        if ok:
+            prod = await loop.run_in_executor(None, _db_get_product, pid)
+            await call.message.answer(
+                "✅ Теги обновлены: <b>" + (new_tags or "убраны") + "</b>\n\n" + _format_admin_card(prod),
+                reply_markup=admin_edit_kb(pid), parse_mode="HTML"
+            )
+        else:
+            await call.message.answer("❌ Не удалось обновить.", reply_markup=admin_main_kb())
+        return
+
+    # Переключаем тег
+    if value in selected:
+        selected.remove(value)
+    else:
+        selected.append(value)
+    await state.update_data(_selected_tags=selected)
+    try:
+        await call.message.edit_reply_markup(reply_markup=admin_tags_kb(selected))
+    except Exception:
+        pass
 
 
 @dp.message_handler(
@@ -2938,18 +3239,20 @@ def product_action_kb_fav(product: Dict[str, Any], category_key: str,
     crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
 
     if is_free_product(product):
-        kb.add(InlineKeyboardButton("🎁 Скачать бесплатно", callback_data=f"get:{pid}"))
+        kb.add(InlineKeyboardButton("Скачать бесплатно 🎁", callback_data=f"get:{pid}"))
     else:
         if price_xtr > 0:
-            kb.add(InlineKeyboardButton(f"⭐ Купить за {price_xtr} Stars",
-                                        callback_data=f"paystars:{pid}"))
+            kb.add(InlineKeyboardButton(
+                f"Купить за {price_xtr} Stars ⭐",
+                callback_data=f"paystars:{pid}"))
         if can_buy_with_crypto(product):
-            kb.add(InlineKeyboardButton(f"💰 Купить за {price_crypto_raw} {crypto_asset}",
-                                        callback_data=f"paycrypto:{pid}"))
+            kb.add(InlineKeyboardButton(
+                f"Купить за {price_crypto_raw} {crypto_asset}",
+                callback_data=f"paycrypto:{pid}"))
 
-    fav_text = "❤️ В избранном" if is_fav else "🤍 В избранное"
+    fav_text = "В избранном ❤️" if is_fav else "В избранное 🤍"
     kb.add(InlineKeyboardButton(fav_text, callback_data=f"fav:toggle:{pid}:{category_key}"))
-    kb.add(InlineKeyboardButton("⬅️ Назад к списку", callback_data=f"back_items:{category_key}"))
+    kb.add(InlineKeyboardButton("← Назад к списку", callback_data=f"back_items:{category_key}"))
     kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
     return kb
 
@@ -3143,15 +3446,19 @@ async def quiz_got_interest(call: types.CallbackQuery, state: FSMContext):
             age_hint = f"\n👶 {p_min}–{p_max} лет" if p_min != p_max else f"\n👶 {p_min} лет"
 
         kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("👁 Посмотреть", callback_data=f"item:{p['product_id']}:{cat_key}"))
+        kb.add(InlineKeyboardButton(
+            _product_btn_label(p),
+            callback_data=f"item:{p['product_id']}:{cat_key}"
+        ))
+        age_text = f"  <i>({p_min}–{p_max} лет)</i>" if (p_min > 0 or p_max < 99) else ""
         await call.message.answer(
-            f"📄 <b>{p['title']}</b>{age_hint}\n{price_str}",
+            f"<b>{p['title']}</b>{age_text}",
             reply_markup=kb, parse_mode="HTML"
         )
 
     back_kb = InlineKeyboardMarkup()
     back_kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
-    await call.message.answer("Нажми на товар чтобы узнать подробнее", reply_markup=back_kb)
+    await call.message.answer("Нажмите на материал чтобы узнать подробнее", reply_markup=back_kb)
 
 
 # =========================
@@ -3324,9 +3631,8 @@ async def _suggest_more(chat_id: int, user_id: int, product: Dict[str, Any]) -> 
         cat_key = _cat_key(_to_str(p.get("category", "")))
         _cat_key_to_name[cat_key] = _to_str(p.get("category", ""))
         price_xtr = int(p.get("price_xtr", 0) or 0)
-        price_str = "🎁" if is_free_product(p) else f"⭐{price_xtr}"
         kb.add(InlineKeyboardButton(
-            f"{price_str} {p['title']}",
+            _product_btn_label(p),
             callback_data=f"item:{p['product_id']}:{cat_key}"
         ))
     await bot.send_message(
