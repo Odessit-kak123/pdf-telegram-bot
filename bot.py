@@ -1222,6 +1222,10 @@ def start_inline_kb() -> InlineKeyboardMarkup:
         InlineKeyboardButton("📂 Мои покупки", callback_data="open:purchases"),
     )
     kb.add(
+        InlineKeyboardButton("❤️ Избранное", callback_data="open:favourites"),
+        InlineKeyboardButton("🎯 Подобрать", callback_data="quiz:start"),
+    )
+    kb.add(
         InlineKeyboardButton("✉️ Поддержка", url=f"https://t.me/{AUTHOR_USERNAME}")
     )
     return kb
@@ -1455,6 +1459,7 @@ def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeybo
                 callback_data=f"paycrypto:{pid}"
             ))
 
+    kb.add(InlineKeyboardButton("❤️ В избранное", callback_data=f"fav:toggle:{pid}:{category_key}"))
     kb.add(InlineKeyboardButton("⬅️ Назад к списку", callback_data=f"back_items:{category_key}"))
     kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
 
