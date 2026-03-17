@@ -1461,11 +1461,31 @@ async def cb_category(call: types.CallbackQuery):
 # ПРЕДПРОСМОТР ТОВАРА
 # =========================
 
+def _has_card_payment(product: Dict[str, Any]) -> bool:
+    """Карта доступна если CARD_NUMBER задан и у товара есть цена в рублях."""
+    if not CARD_NUMBER:
+        return False
+    price_rub = int(product.get("price_rub", 0) or 0)
+    # Если цена в рублях задана у товара — используем её
+    # Если задана глобальная CARD_PRICE_RUB — тоже показываем карту
+    return price_rub > 0 or bool(CARD_PRICE_RUB)
+
+
+def _count_pay_methods(product: Dict[str, Any]) -> int:
+    """Считает количество доступных способов оплаты."""
+    count = 0
+    if int(product.get("price_xtr", 0) or 0) > 0:
+        count += 1
+    if can_buy_with_crypto(product):
+        count += 1
+    if _has_card_payment(product):
+        count += 1
+    return count
+
+
 def _has_multiple_pay_methods(product: Dict[str, Any]) -> bool:
     """Проверяет, доступно ли несколько способов оплаты."""
-    has_stars = int(product.get("price_xtr", 0) or 0) > 0
-    has_crypto = can_buy_with_crypto(product)
-    return has_stars and has_crypto
+    return _count_pay_methods(product) > 1
 
 
 def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeyboardMarkup:
@@ -1478,10 +1498,11 @@ def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeybo
         # Несколько способов — одна кнопка "Купить", откроет меню выбора
         kb.add(InlineKeyboardButton("Купить", callback_data=f"buy:{pid}:{category_key}"))
     else:
-        # Только один способ — сразу нужная кнопка
+        # Только один способ — показываем его напрямую
         price_xtr = int(product.get("price_xtr", 0) or 0)
         price_crypto_raw = _to_str(product.get("price_crypto", ""))
         crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
+        price_rub_single = int(product.get("price_rub", 0) or 0)
         if price_xtr > 0:
             kb.add(InlineKeyboardButton(
                 f"Купить за {price_xtr} Stars ⭐",
@@ -1491,6 +1512,12 @@ def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeybo
             kb.add(InlineKeyboardButton(
                 f"Купить за {price_crypto_raw} {crypto_asset}",
                 callback_data=f"paycrypto:{pid}"
+            ))
+        elif _has_card_payment(product):
+            rub_label = str(price_rub_single) if price_rub_single > 0 else CARD_PRICE_RUB
+            kb.add(InlineKeyboardButton(
+                f"Купить за {rub_label} ₽ 💳",
+                callback_data=f"paycard:{pid}:{category_key}"
             ))
 
     kb.add(InlineKeyboardButton("В избранное ❤️", callback_data=f"fav:toggle:{pid}:{category_key}"))
@@ -3083,15 +3110,6 @@ async def adm_edit_field(call: types.CallbackQuery, state: FSMContext):
     }
     if field == "category":
         await _send_category_choice(call.message.chat.id, "Выбери <b>новую категорию</b>")
-    elif field == "price_rub":
-        try:
-            v = int(text)
-            if v < 0:
-                raise ValueError
-            update["price_rub"] = v
-        except ValueError:
-            await message.answer("⚠️ Введи целое неотрицательное число или 0 чтобы убрать.")
-            return
     elif field == "age_range":
         # Показываем кнопки возраста, сохраняем текущее значение как уже выбранное
         loop = asyncio.get_running_loop()
@@ -3285,6 +3303,15 @@ async def adm_save_field(message: types.Message, state: FSMContext):
                 await message.answer("⚠️ Неверный формат. Пример: <code>1.5</code>", parse_mode="HTML")
                 return
             update["price_crypto"] = text
+    elif field == "price_rub":
+        try:
+            v = int(text)
+            if v < 0:
+                raise ValueError
+            update["price_rub"] = v
+        except ValueError:
+            await message.answer("⚠️ Введи целое неотрицательное число или 0 чтобы убрать.")
+            return
     elif field == "file_id":
         if message.document and message.document.mime_type == "application/pdf":
             update["file_id"] = message.document.file_id
@@ -3417,6 +3444,12 @@ def product_action_kb_fav(product: Dict[str, Any], category_key: str,
             kb.add(InlineKeyboardButton(
                 f"Купить за {price_crypto_raw} {crypto_asset}",
                 callback_data=f"paycrypto:{pid}"))
+        elif _has_card_payment(product):
+            price_rub_fav = int(product.get("price_rub", 0) or 0)
+            rub_label_fav = str(price_rub_fav) if price_rub_fav > 0 else CARD_PRICE_RUB
+            kb.add(InlineKeyboardButton(
+                f"Купить за {rub_label_fav} ₽ 💳",
+                callback_data=f"paycard:{pid}:{category_key}"))
 
     fav_text = "В избранном ❤️" if is_fav else "В избранное 🤍"
     kb.add(InlineKeyboardButton(fav_text, callback_data=f"fav:toggle:{pid}:{category_key}"))
