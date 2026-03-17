@@ -2579,12 +2579,44 @@ WEBAPP_PORT = int(os.getenv("PORT", 8080))
 
 async def on_startup(dp):
     init_db()
-    _db_cleanup_pending_orders()  # Чистим устаревшие pending при каждом старте
+    _db_cleanup_pending_orders()
+    await _setup_bot_commands()
     if WEBHOOK_URL:
         await bot.set_webhook(WEBHOOK_URL)
         logger.info("Webhook set: %s", WEBHOOK_URL)
     else:
         logger.info("No RAILWAY_PUBLIC_DOMAIN — using polling")
+
+
+async def _setup_bot_commands():
+    """Устанавливает команды бота: разные для пользователей и для админов."""
+    from aiogram.types import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+
+    # Команды для всех пользователей
+    user_commands = [
+        BotCommand("start", "🏠 Главная"),
+        BotCommand("help", "❓ Поддержка"),
+    ]
+    await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+
+    # Команды для каждого админа (включают admin + refresh)
+    admin_commands = [
+        BotCommand("start", "🏠 Главная"),
+        BotCommand("admin", "🛠 Панель управления"),
+        BotCommand("refresh", "🔄 Сбросить кеш"),
+        BotCommand("help", "❓ Поддержка"),
+        BotCommand("cancel", "❌ Отменить действие"),
+    ]
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.set_my_commands(
+                admin_commands,
+                scope=BotCommandScopeChat(chat_id=admin_id)
+            )
+        except Exception as e:
+            logger.warning("Не удалось установить команды для админа %s: %s", admin_id, e)
+
+    logger.info("Bot commands configured")
 
 
 async def on_shutdown(dp):
