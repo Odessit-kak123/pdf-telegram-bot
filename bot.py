@@ -494,25 +494,46 @@ async def load_products() -> List[Dict[str, Any]]:
 
 
 def is_free_product(p: Dict[str, Any]) -> bool:
-    cat = str(p.get("category", "")).strip()
+    """
+    Бесплатность определяется ТОЛЬКО ценами, не категорией.
+    Категория — для навигации, цена — для монетизации.
+    """
     price_xtr = int(p.get("price_xtr", 0) or 0)
-    # FIX #5: используем безопасный парсинг float
-    price_crypto = _to_float_safe(p.get("price_crypto", 0))
-    return (price_xtr == 0 and price_crypto == 0) or (cat == FREE_CATEGORY_NAME)
+    crypto_amount = parse_crypto_amount(p)  # None или Decimal > 0
+    return price_xtr == 0 and crypto_amount is None
+
+
+# Разрешённый формат price_crypto: целое или десятичное с точкой, например "1", "1.5", "10.99"
+_CRYPTO_AMOUNT_RE = re.compile(r"^\d+(\.\d+)?$")
 
 
 def parse_crypto_amount(product: Dict[str, Any]) -> Optional[Decimal]:
-    """Единая строгая валидация crypto-суммы. None = нельзя продавать за крипту."""
+    """
+    Единая строгая валидация crypto-суммы.
+    Разрешает только формат: целое или десятичное с точкой ("1", "1.5", "10.99").
+    Отвергает: "1E-3", "1,5", "0", "-1", "1 USDT", "abc".
+    Возвращает None если сумма невалидна или нулевая.
+    """
     raw = _to_str(product.get("price_crypto", ""))
     if not raw:
+        return None
+    # Строгий формат: только цифры и опциональная точка
+    if not _CRYPTO_AMOUNT_RE.match(raw):
+        logger.warning(
+            "Невалидный формат price_crypto для товара %s: %r (ожидается '1' или '1.50')",
+            product.get("product_id"), raw
+        )
         return None
     try:
         amount = Decimal(raw)
         if amount <= 0:
+            logger.warning("Нулевая/отрицательная crypto-сумма для товара %s: %r",
+                           product.get("product_id"), raw)
             return None
         return amount
     except InvalidOperation:
-        logger.warning("Невалидная crypto-сумма для товара %s: %r", product.get("product_id"), raw)
+        logger.warning("Невалидная crypto-сумма для товара %s: %r",
+                       product.get("product_id"), raw)
         return None
 
 
@@ -1485,6 +1506,12 @@ async def cb_check_crypto(call: types.CallbackQuery):
             "crypto_asset": pending.get("expected_asset", ""),
         }
     else:
+        # Аномалия: pending не найден при проверке crypto invoice
+        logger.warning(
+            "Crypto cb_check_crypto без pending: user=%s pid=%s invoice_id=%s",
+            user.id, pid, invoice_id
+        )
+        # Fallback на CSV
         _all_products = await load_products()
         product = next((p for p in _all_products if p["product_id"] == pid), None)
         if not product:
@@ -1648,7 +1675,12 @@ async def successful_payment(message: types.Message):
             "price_xtr": pending.get("expected_amount", "0"),
         }
     else:
-        # Fallback на CSV если pending не найден
+        # Аномалия: pending не найден при успешной оплате Stars
+        logger.warning(
+            "Stars successful_payment без pending: user=%s pid=%s key=%s",
+            message.from_user.id, pid, stars_order_key
+        )
+        # Fallback на CSV
         _all_products = await load_products()
         product = next((p for p in _all_products if p["product_id"] == pid), None)
         if not product:
