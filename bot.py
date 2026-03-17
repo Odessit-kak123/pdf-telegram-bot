@@ -258,6 +258,7 @@ def init_db() -> None:
                 age_min        INTEGER NOT NULL DEFAULT 0,
                 age_max        INTEGER NOT NULL DEFAULT 99,
                 tags           TEXT    NOT NULL DEFAULT '',
+                price_rub      INTEGER NOT NULL DEFAULT 0,
                 active         INTEGER NOT NULL DEFAULT 1,
                 created_at     TEXT    NOT NULL,
                 updated_at     TEXT    NOT NULL
@@ -268,6 +269,7 @@ def init_db() -> None:
             ("age_min", "INTEGER NOT NULL DEFAULT 0"),
             ("age_max", "INTEGER NOT NULL DEFAULT 99"),
             ("tags",    "TEXT NOT NULL DEFAULT ''"),
+            ("price_rub", "INTEGER NOT NULL DEFAULT 0"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE products ADD COLUMN {col} {definition}")
@@ -337,8 +339,8 @@ def _db_insert_product(data: Dict[str, Any]) -> bool:
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO products
                    (product_id, title, description, price_xtr, price_crypto, crypto_asset,
-                    file_id, preview_file_id, category, age_min, age_max, tags, active, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                    file_id, preview_file_id, category, age_min, age_max, tags, price_rub, active, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
                 (
                     data["product_id"], data["title"], data.get("description", ""),
                     int(data.get("price_xtr", 0) or 0),
@@ -346,6 +348,7 @@ def _db_insert_product(data: Dict[str, Any]) -> bool:
                     data["file_id"], data.get("preview_file_id", ""),
                     data.get("category", "Без категории"),
                     age_min, age_max, tags,
+                    int(data.get("price_rub", 0) or 0),
                     now, now,
                 )
             )
@@ -826,6 +829,7 @@ async def load_products() -> List[Dict[str, Any]]:
                 "age_min": int(r.get("age_min", 0) or 0),
                 "age_max": int(r.get("age_max", 99) or 99),
                 "tags": r.get("tags", "") or "",
+                "price_rub": int(r.get("price_rub", 0) or 0),
             })
         _products_cache = (time.time(), products)
         return products
@@ -1506,6 +1510,7 @@ def _format_product_card(product: Dict[str, Any]) -> str:
     age_max = int(product.get("age_max", 99) or 99)
     tags = _to_str(product.get("tags", ""))
 
+    price_rub = int(product.get("price_rub", 0) or 0)
     if is_free_product(product):
         price_line = "<b>Бесплатно</b> 🎁"
     else:
@@ -1513,7 +1518,9 @@ def _format_product_card(product: Dict[str, Any]) -> str:
         if price_xtr > 0:
             parts.append(f"<b>{price_xtr} Stars</b> ⭐")
         if can_buy_with_crypto(product) and crypto_amount is not None:
-            parts.append(f"💰 <b>{crypto_amount} {crypto_asset}</b>")
+            parts.append(f"<b>{crypto_amount} {crypto_asset}</b>")
+        if price_rub > 0:
+            parts.append(f"<b>{price_rub} ₽</b> 💳")
         price_line = "  |  ".join(parts) if parts else "💳 Уточните цену"
 
     cat_line = f"\n<i>📂 {category}</i>" if category else ""
@@ -1713,7 +1720,14 @@ def payment_methods_kb(product: Dict[str, Any], category_key: str) -> InlineKeyb
         ))
 
     if CARD_NUMBER:
-        card_label = f"Карта РФ — {CARD_PRICE_RUB} ₽" if CARD_PRICE_RUB else "Карта РФ (Юмани)"
+        # Цена: берём из товара, потом из глобальной переменной, потом просто метку
+        rub_price = int(product.get("price_rub", 0) or 0)
+        if rub_price > 0:
+            card_label = f"Карта РФ — {rub_price} ₽"
+        elif CARD_PRICE_RUB:
+            card_label = f"Карта РФ — {CARD_PRICE_RUB} ₽"
+        else:
+            card_label = "Карта РФ (Юмани)"
         kb.add(InlineKeyboardButton(card_label, callback_data=f"paycard:{pid}:{category_key}"))
 
     kb.add(InlineKeyboardButton("← Назад к товару", callback_data=f"back_to_item:{pid}:{category_key}"))
@@ -2263,6 +2277,7 @@ class AddProduct(StatesGroup):
     waiting_category = State()
     waiting_price_xtr = State()
     waiting_price_crypto = State()
+    waiting_price_rub = State()
     waiting_age = State()
     waiting_tags = State()
     confirm = State()
@@ -2291,7 +2306,8 @@ def admin_edit_kb(product_id: str) -> InlineKeyboardMarkup:
     fields = [
         ("Название", "title"), ("Описание", "desc"),
         ("Категория", "category"), ("Цена Stars", "price_xtr"),
-        ("Цена Крипто", "price_crypto"), ("PDF файл", "file_id"),
+        ("Цена Крипто", "price_crypto"), ("Цена ₽", "price_rub"),
+        ("PDF файл", "file_id"),
         ("Превью фото", "preview_file_id"), ("Возраст", "age_range"),
         ("Теги", "tags"),
     ]
@@ -2340,6 +2356,9 @@ def _format_admin_card(p: dict) -> str:
         price_parts.append(f"⭐ {price_xtr} Stars")
     if price_crypto:
         price_parts.append(f"💰 {price_crypto} {crypto_asset}")
+    price_rub_a = int(p.get("price_rub", 0) or 0)
+    if price_rub_a > 0:
+        price_parts.append(f"💳 {price_rub_a} ₽")
     if not price_parts:
         price_parts.append("🎁 Бесплатно")
 
@@ -2680,7 +2699,7 @@ async def adm_got_price_xtr(message: types.Message, state: FSMContext):
     await state.update_data(price_xtr=price)
     await state.set_state(AddProduct.waiting_price_crypto)
     await message.answer(
-        f"Шаг 7/9: Цена в <b>крипте</b> (например <code>1.5</code>)\n"
+        f"Шаг 7/10: Цена в <b>крипте</b> (например <code>1.5</code>)\n"
         f"Валюта по умолчанию: {CRYPTO_PAY_DEFAULT_ASSET}\n"
         "Или напиши <b>нет</b>",
         reply_markup=cancel_kb(),
@@ -2705,6 +2724,35 @@ async def adm_got_price_crypto(message: types.Message, state: FSMContext):
             )
             return
         await state.update_data(price_crypto=normalized, crypto_asset=CRYPTO_PAY_DEFAULT_ASSET)
+
+    await state.set_state(AddProduct.waiting_price_rub)
+    await message.answer(
+        "Шаг 8/10: Цена в <b>рублях</b> (для оплаты картой РФ)\n\n"
+        "Введи целое число, например: <code>150</code>\n"
+        "Или напиши <b>нет</b> если оплата картой недоступна для этого товара",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML"
+    )
+
+
+@dp.message_handler(user_id=ADMIN_IDS, state=AddProduct.waiting_price_rub)
+async def adm_got_price_rub(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if text.lower() == "нет":
+        await state.update_data(price_rub=0)
+    else:
+        try:
+            price = int(text)
+            if price < 0:
+                raise ValueError
+            await state.update_data(price_rub=price)
+        except ValueError:
+            await message.answer(
+                "⚠️ Введи целое неотрицательное число. Например: <code>150</code>\n"
+                "Или напиши <b>нет</b>",
+                parse_mode="HTML"
+            )
+            return
 
     await state.set_state(AddProduct.waiting_age)
     await _send_age_choice(message.chat.id)
@@ -2760,7 +2808,7 @@ def admin_tags_kb(selected: list = None) -> InlineKeyboardMarkup:
 async def _send_age_choice(chat_id: int) -> None:
     await bot.send_message(
         chat_id,
-        "Шаг 8/9: Для какого <b>возраста</b>?\n\n"
+        "Шаг 9/10: Для какого <b>возраста</b>?\n\n"
         "Выбери готовый диапазон или введи свой:",
         reply_markup=admin_age_kb(),
         parse_mode="HTML"
@@ -2771,7 +2819,7 @@ async def _send_tags_choice(chat_id: int, selected: list = None) -> None:
     selected = selected or []
     await bot.send_message(
         chat_id,
-        "Шаг 9/9: Выбери <b>теги</b> — по ним квиз подбирает материалы.\n\n"
+        "Шаг 10/10: Выбери <b>теги</b> — по ним квиз подбирает материалы.\n\n"
         "Можно выбрать несколько:",
         reply_markup=admin_tags_kb(selected),
         parse_mode="HTML"
@@ -2909,8 +2957,10 @@ async def _show_add_confirm(msg_or_call, state: FSMContext) -> None:
 
     price_line = f"⭐ {data['price_xtr']} Stars"
     if data.get("price_crypto"):
-        price_line += f"  |  💰 {data['price_crypto']} {data.get('crypto_asset', '')}"
-    if not data["price_xtr"] and not data.get("price_crypto"):
+        price_line += f"  |  {data['price_crypto']} {data.get('crypto_asset', '')}"
+    if int(data.get("price_rub", 0) or 0) > 0:
+        price_line += f"  |  {data['price_rub']} ₽ 💳"
+    if not data["price_xtr"] and not data.get("price_crypto") and not int(data.get("price_rub", 0) or 0):
         price_line = "🎁 Бесплатно"
 
     age_range = data.get("age_range", "")
@@ -3013,6 +3063,7 @@ async def adm_edit_field(call: types.CallbackQuery, state: FSMContext):
         "desc": "Введи новое <b>описание</b> (или <b>нет</b> для пустого):",
         "price_xtr": "Введи новую цену в <b>Stars</b> (целое число):",
         "price_crypto": "Введи новую цену в <b>крипте</b> или <b>нет</b>:",
+        "price_rub": "Введи новую цену в <b>рублях</b> (целое число, 0 = убрать):",
         "file_id": "Отправь новый <b>PDF-файл</b>:",
         "preview_file_id": "Отправь новое <b>фото-превью</b> или напиши <b>нет</b>:",
         "age_range": (
@@ -3032,6 +3083,15 @@ async def adm_edit_field(call: types.CallbackQuery, state: FSMContext):
     }
     if field == "category":
         await _send_category_choice(call.message.chat.id, "Выбери <b>новую категорию</b>")
+    elif field == "price_rub":
+        try:
+            v = int(text)
+            if v < 0:
+                raise ValueError
+            update["price_rub"] = v
+        except ValueError:
+            await message.answer("⚠️ Введи целое неотрицательное число или 0 чтобы убрать.")
+            return
     elif field == "age_range":
         # Показываем кнопки возраста, сохраняем текущее значение как уже выбранное
         loop = asyncio.get_running_loop()
@@ -3622,10 +3682,12 @@ async def cb_pay_card(call: types.CallbackQuery, state: FSMContext):
 
     # Сохраняем снимок товара как pending order
     order_key = f"card:{user.id}:{int(time.time())}"
+    rub_price_val = int(product.get("price_rub", 0) or 0)
+    rub_label = str(rub_price_val) if rub_price_val > 0 else (CARD_PRICE_RUB or "—")
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None, _db_save_pending_order,
-        user.id, product, "card", CARD_PRICE_RUB or "—", "RUB", order_key
+        user.id, product, "card", rub_label, "RUB", order_key
     )
 
     # Сохраняем в FSM — понадобится когда придёт скриншот
@@ -3636,7 +3698,8 @@ async def cb_pay_card(call: types.CallbackQuery, state: FSMContext):
     )
     await state.set_state(CardPayState.waiting_screenshot)
 
-    price_line = f"\n💰 Сумма: <b>{CARD_PRICE_RUB} ₽</b>" if CARD_PRICE_RUB else ""
+    rub_show = rub_price_val if rub_price_val > 0 else (int(CARD_PRICE_RUB) if CARD_PRICE_RUB.isdigit() else 0)
+    price_line = f"\n💰 Сумма: <b>{rub_show} ₽</b>" if rub_show else ""
     card_formatted = " ".join(
         CARD_NUMBER[i:i+4] for i in range(0, len(CARD_NUMBER), 4)
     )
