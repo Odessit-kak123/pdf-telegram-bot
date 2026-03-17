@@ -1,4 +1,3 @@
-Content is user-generated and unverified.
 import os
 import re
 import json
