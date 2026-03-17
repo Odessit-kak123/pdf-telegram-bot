@@ -18,6 +18,9 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     LabeledPrice
 )
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils import executor
 
 try:
@@ -87,7 +90,7 @@ logger.info("CRYPTO PAY BASE URL: %s", CRYPTO_PAY_BASE_URL)
 logger.info("CRYPTO PAY DEFAULT ASSET: %s", CRYPTO_PAY_DEFAULT_ASSET)
 
 bot = Bot(token=BOT_TOKEN.strip())
-dp = Dispatcher(bot)
+dp = Dispatcher(bot, storage=MemoryStorage())
 
 
 # =========================
@@ -210,8 +213,140 @@ def init_db() -> None:
                 UNIQUE(payment_method, external_invoice_id)
             )
         """)
+        # products: основное хранилище товаров (вместо Google Sheets CSV)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id     TEXT    NOT NULL UNIQUE,
+                title          TEXT    NOT NULL,
+                description    TEXT,
+                price_xtr      INTEGER NOT NULL DEFAULT 0,
+                price_crypto   TEXT,
+                crypto_asset   TEXT,
+                file_id        TEXT    NOT NULL,
+                preview_file_id TEXT,
+                category       TEXT    NOT NULL DEFAULT 'Без категории',
+                active         INTEGER NOT NULL DEFAULT 1,
+                created_at     TEXT    NOT NULL,
+                updated_at     TEXT    NOT NULL
+            )
+        """)
         conn.commit()
     logger.info("SQLite DB ready: %s", DB_PATH)
+
+
+# ---- products CRUD ----
+
+def _db_get_all_products(active_only: bool = True) -> List[Dict]:
+    with _get_db() as conn:
+        conn.row_factory = sqlite3.Row
+        if active_only:
+            rows = conn.execute(
+                "SELECT * FROM products WHERE active=1 ORDER BY category, title"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM products ORDER BY category, title"
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _db_get_product(product_id: str) -> Optional[Dict]:
+    with _get_db() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM products WHERE product_id=?", (product_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _db_insert_product(data: Dict[str, Any]) -> bool:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with _get_db() as conn:
+            cursor = conn.execute(
+                """INSERT OR IGNORE INTO products
+                   (product_id, title, description, price_xtr, price_crypto, crypto_asset,
+                    file_id, preview_file_id, category, active, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                (
+                    data["product_id"], data["title"], data.get("description", ""),
+                    int(data.get("price_xtr", 0) or 0),
+                    data.get("price_crypto", ""), data.get("crypto_asset", ""),
+                    data["file_id"], data.get("preview_file_id", ""),
+                    data.get("category", "Без категории"), now, now,
+                )
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.exception("products insert error: %s", e)
+        return False
+
+
+def _db_update_product(product_id: str, fields: Dict[str, Any]) -> bool:
+    if not fields:
+        return False
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fields["updated_at"] = now
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [product_id]
+    try:
+        with _get_db() as conn:
+            cursor = conn.execute(
+                f"UPDATE products SET {set_clause} WHERE product_id=?", values
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+    except Exception as e:
+        logger.exception("products update error: %s", e)
+        return False
+
+
+def _db_set_product_active(product_id: str, active: bool) -> bool:
+    return _db_update_product(product_id, {"active": 1 if active else 0})
+
+
+def _db_import_from_csv_if_empty(products_from_csv: List[Dict[str, Any]]) -> int:
+    """Импортирует товары из CSV в SQLite если таблица пустая. Возвращает кол-во импортированных."""
+    with _get_db() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+    if count > 0:
+        return 0
+    imported = 0
+    for p in products_from_csv:
+        if _db_insert_product(p):
+            imported += 1
+    if imported:
+        logger.info("Импортировано %d товаров из CSV в SQLite", imported)
+    return imported
+
+
+def _db_get_stats() -> Dict[str, Any]:
+    """Статистика для админки."""
+    with _get_db() as conn:
+        total_purchases = conn.execute("SELECT COUNT(*) FROM purchases").fetchone()[0]
+        unique_buyers = conn.execute("SELECT COUNT(DISTINCT user_id) FROM purchases").fetchone()[0]
+        products_active = conn.execute("SELECT COUNT(*) FROM products WHERE active=1").fetchone()[0]
+        products_total = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        # Топ-5 товаров
+        top = conn.execute(
+            """SELECT product_title, COUNT(*) as cnt
+               FROM purchases GROUP BY product_id
+               ORDER BY cnt DESC LIMIT 5"""
+        ).fetchall()
+        # Продажи за сегодня
+        today = conn.execute(
+            "SELECT COUNT(*) FROM purchases WHERE date >= date('now')"
+        ).fetchone()[0]
+    return {
+        "total_purchases": total_purchases,
+        "unique_buyers": unique_buyers,
+        "products_active": products_active,
+        "products_total": products_total,
+        "top_products": [(r[0], r[1]) for r in top],
+        "today": today,
+    }
 
 
 # ---- pending_orders CRUD ----
@@ -359,6 +494,7 @@ async def _mirror_to_sheets(row: list) -> None:
 # =========================
 
 _products_cache: Tuple[float, List[Dict[str, Any]]] = (0.0, [])
+_csv_imported: bool = False  # Флаг: CSV уже был импортирован в SQLite
 
 
 def _to_int(value: Any, default: int = 0) -> int:
@@ -413,84 +549,91 @@ def _to_float_safe(value: Any, default: float = 0.0) -> float:
 
 
 def _sync_fetch_csv() -> str:
-    """Синхронная загрузка CSV товаров — вызывать через run_in_executor."""
+    """Синхронная загрузка CSV товаров — для первичной миграции."""
     r = requests.get(PRODUCTS_CSV_URL, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     r.encoding = "utf-8"
     return r.text.strip()
 
 
+def _parse_csv_products(csv_text: str) -> List[Dict[str, Any]]:
+    """Разбирает CSV и возвращает список товаров."""
+    products = []
+    reader = csv.DictReader(io.StringIO(csv_text))
+    for row in reader:
+        try:
+            pid = _to_str(row.get("product_id", ""))
+            title = _to_str(row.get("title", ""))
+            file_id = _to_str(row.get("file_id", ""))
+            if not pid or not title or not file_id:
+                continue
+            price_xtr = _to_int(row.get("price_xtr", ""), 0)
+            if price_xtr < 0:
+                continue
+            products.append({
+                "product_id": pid,
+                "title": title,
+                "description": _to_str(row.get("description", "")) or "PDF файл",
+                "price_xtr": price_xtr,
+                "price_crypto": _to_str(row.get("price_crypto", "")),
+                "crypto_asset": _to_str(row.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper(),
+                "file_id": file_id,
+                "preview_file_id": _to_str(row.get("preview_file_id", "")),
+                "category": _to_str(row.get("category", ""), "Без категории"),
+                "active": _to_bool(row.get("active", "true")),
+            })
+        except Exception:
+            logger.exception("Ошибка разбора строки CSV")
+    return products
+
+
 async def load_products() -> List[Dict[str, Any]]:
     """
-    Колонки:
-    product_id | title | description | price_xtr | price_crypto | crypto_asset |
-    file_id | active | category | preview_file_id
-
-    Загрузка CSV через run_in_executor — не блокирует event loop.
+    Основной источник товаров: SQLite.
+    При первом запуске импортирует из CSV если таблица пустая.
     """
-    global _products_cache
+    global _products_cache, _csv_imported
     ts, cached = _products_cache
     if cached and (time.time() - ts) < PRODUCTS_CACHE_TTL:
         return cached
 
+    loop = asyncio.get_running_loop()
+
+    # Миграция: один раз при старте импортируем CSV в SQLite
+    if not _csv_imported:
+        try:
+            csv_text = await loop.run_in_executor(None, _sync_fetch_csv)
+            if csv_text:
+                csv_products = _parse_csv_products(csv_text)
+                await loop.run_in_executor(None, _db_import_from_csv_if_empty, csv_products)
+        except Exception as e:
+            logger.warning("CSV миграция не удалась (не критично): %s", e)
+        _csv_imported = True
+
+    # Основная загрузка из SQLite
     try:
-        loop = asyncio.get_running_loop()
-        csv_text = await loop.run_in_executor(None, _sync_fetch_csv)
-        if not csv_text:
-            logger.warning("CSV товаров пуст (нет доступа/не опубликовано).")
-            if cached:
-                logger.warning("Возвращаем устаревший кеш товаров (CSV пуст).")
-                return cached
-            return []
+        rows = await loop.run_in_executor(None, _db_get_all_products, True)
+        products = []
+        for r in rows:
+            products.append({
+                "product_id": r["product_id"],
+                "title": r["title"],
+                "description": r.get("description") or "PDF файл",
+                "price_xtr": int(r.get("price_xtr", 0) or 0),
+                "price_crypto": r.get("price_crypto", ""),
+                "crypto_asset": r.get("crypto_asset", "") or CRYPTO_PAY_DEFAULT_ASSET,
+                "file_id": r["file_id"],
+                "preview_file_id": r.get("preview_file_id", ""),
+                "category": r.get("category", "Без категории"),
+            })
+        _products_cache = (time.time(), products)
+        return products
     except Exception as e:
-        logger.exception("Не удалось загрузить CSV товаров: %s", e)
+        logger.exception("Ошибка загрузки товаров из SQLite: %s", e)
         if cached:
-            logger.warning("Возвращаем устаревший кеш товаров (ошибка загрузки).")
+            logger.warning("Возвращаем устаревший кеш товаров.")
             return cached
         return []
-
-    products: List[Dict[str, Any]] = []
-    reader = csv.DictReader(io.StringIO(csv_text))
-
-    for row in reader:
-        try:
-            if not _to_bool(row.get("active", "")):
-                continue
-
-            pid = _to_str(row.get("product_id", ""))
-            title = _to_str(row.get("title", ""))
-            desc = _to_str(row.get("description", ""))
-            file_id = _to_str(row.get("file_id", ""))
-            preview_file_id = _to_str(row.get("preview_file_id", ""))
-            category = _to_str(row.get("category", ""), "Без категории")
-
-            if not pid or not title or not file_id:
-                continue
-
-            price_xtr = _to_int(row.get("price_xtr", ""), 0)
-            if price_xtr < 0:
-                continue
-
-            price_crypto_raw = _to_str(row.get("price_crypto", ""))
-            crypto_asset = _to_str(row.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
-
-            products.append({
-                "product_id": pid,
-                "title": title,
-                "description": desc or "PDF файл",
-                "price_xtr": price_xtr,
-                "price_crypto": price_crypto_raw,
-                "crypto_asset": crypto_asset,
-                "file_id": file_id,
-                "preview_file_id": preview_file_id,
-                "category": category,
-            })
-        except Exception:
-            logger.exception("Ошибка разбора строки товара")
-            continue
-
-    _products_cache = (time.time(), products)
-    return products
 
 
 def is_free_product(p: Dict[str, Any]) -> bool:
@@ -1757,6 +1900,500 @@ async def debug_get_file_id_photo(message: types.Message):
         f"🖼 preview_file_id:\n<code>{photo.file_id}</code>",
         parse_mode="HTML"
     )
+
+
+# =========================
+# ADMIN PANEL — FSM States
+# =========================
+
+class AddProduct(StatesGroup):
+    waiting_pdf          = State()
+    waiting_preview      = State()
+    waiting_title        = State()
+    waiting_desc         = State()
+    waiting_category     = State()
+    waiting_price_xtr    = State()
+    waiting_price_crypto = State()
+    confirm              = State()
+
+
+class EditProduct(StatesGroup):
+    choosing_field = State()
+    waiting_value  = State()
+
+
+# ---- admin keyboards ----
+
+def admin_main_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ Добавить товар", callback_data="adm:add"),
+        InlineKeyboardButton("📋 Список товаров", callback_data="adm:list"),
+    )
+    kb.add(
+        InlineKeyboardButton("📊 Статистика", callback_data="adm:stats"),
+        InlineKeyboardButton("🔄 Сбросить кеш", callback_data="adm:refresh"),
+    )
+    return kb
+
+
+def admin_edit_kb(product_id: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    fields = [
+        ("Название", "title"), ("Описание", "desc"),
+        ("Категория", "category"), ("Цена Stars", "price_xtr"),
+        ("Цена Крипто", "price_crypto"), ("PDF файл", "file_id"),
+        ("Превью фото", "preview_file_id"),
+    ]
+    for label, field in fields:
+        kb.add(InlineKeyboardButton(label, callback_data=f"adm:ef:{product_id}:{field}"))
+    kb.add(InlineKeyboardButton("⬅️ Назад к списку", callback_data="adm:list"))
+    return kb
+
+
+def admin_confirm_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Добавить", callback_data="adm:confirm"),
+        InlineKeyboardButton("❌ Отмена", callback_data="adm:cancel"),
+    )
+    return kb
+
+
+def _gen_product_id() -> str:
+    import uuid
+    return "p" + uuid.uuid4().hex[:8]
+
+
+def _format_admin_card(p: dict) -> str:
+    active_str = "🟢 Активен" if p.get("active", 1) else "🔴 Неактивен"
+    price_xtr = int(p.get("price_xtr", 0) or 0)
+    price_crypto = p.get("price_crypto", "") or ""
+    crypto_asset = p.get("crypto_asset", "") or ""
+    price_parts = []
+    if price_xtr > 0:
+        price_parts.append(f"⭐ {price_xtr} Stars")
+    if price_crypto:
+        price_parts.append(f"💰 {price_crypto} {crypto_asset}")
+    if not price_parts:
+        price_parts.append("🎁 Бесплатно")
+    return (
+        f"<b>{p['title']}</b>\n"
+        f"📂 {p.get('category', '—')}\n"
+        f"💳 {' | '.join(price_parts)}\n"
+        f"🆔 <code>{p['product_id']}</code>\n"
+        f"{active_str}"
+    )
+
+
+# ---- /admin ----
+
+@dp.message_handler(commands=["admin"], user_id=[ADMIN_CHAT_ID])
+async def cmd_admin(message: types.Message):
+    await message.answer(
+        "🛠 <b>Панель управления</b>",
+        reply_markup=admin_main_kb(),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "adm:back", user_id=[ADMIN_CHAT_ID])
+async def adm_back(call: types.CallbackQuery):
+    await call.answer()
+    try:
+        await call.message.edit_text(
+            "🛠 <b>Панель управления</b>",
+            reply_markup=admin_main_kb(),
+            parse_mode="HTML"
+        )
+    except Exception:
+        await call.message.answer("🛠 <b>Панель управления</b>", reply_markup=admin_main_kb(), parse_mode="HTML")
+
+
+@dp.callback_query_handler(lambda c: c.data == "adm:list", user_id=[ADMIN_CHAT_ID])
+async def adm_list(call: types.CallbackQuery):
+    await call.answer()
+    loop = asyncio.get_running_loop()
+    products = await loop.run_in_executor(None, _db_get_all_products, False)
+    if not products:
+        await call.message.answer("Товаров пока нет.", reply_markup=admin_main_kb())
+        return
+    await call.message.answer(f"📋 Товаров: {len(products)}")
+    for p in products:
+        active = bool(p.get("active", 1))
+        status = "🟢" if active else "🔴"
+        price_xtr = int(p.get("price_xtr", 0) or 0)
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton("✏️ Ред.", callback_data=f"adm:edit:{p['product_id']}"),
+            InlineKeyboardButton(
+                "🔴 Откл." if active else "🟢 Вкл.",
+                callback_data=f"adm:toggle:{p['product_id']}"
+            ),
+        )
+        text = (
+            f"{status} <b>{p['title']}</b>\n"
+            f"📂 {p.get('category', '—')}  |  "
+            + (f"⭐ {price_xtr} Stars" if price_xtr else "🎁 Бесплатно")
+            + f"\n<code>{p['product_id']}</code>"
+        )
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:toggle:"), user_id=[ADMIN_CHAT_ID])
+async def adm_toggle(call: types.CallbackQuery):
+    pid = call.data.split("adm:toggle:", 1)[1]
+    loop = asyncio.get_running_loop()
+    prod = await loop.run_in_executor(None, _db_get_product, pid)
+    if not prod:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    new_active = not bool(prod.get("active", 1))
+    await loop.run_in_executor(None, _db_set_product_active, pid, new_active)
+    global _products_cache
+    _products_cache = (0.0, [])
+    status_text = "🟢 активирован" if new_active else "🔴 деактивирован"
+    await call.answer(f"Товар {status_text}!", show_alert=True)
+    try:
+        new_kb = InlineKeyboardMarkup(row_width=2)
+        new_kb.add(
+            InlineKeyboardButton("✏️ Ред.", callback_data=f"adm:edit:{pid}"),
+            InlineKeyboardButton(
+                "🔴 Откл." if new_active else "🟢 Вкл.",
+                callback_data=f"adm:toggle:{pid}"
+            ),
+        )
+        await call.message.edit_reply_markup(reply_markup=new_kb)
+    except Exception:
+        pass
+
+
+@dp.callback_query_handler(lambda c: c.data == "adm:stats", user_id=[ADMIN_CHAT_ID])
+async def adm_stats(call: types.CallbackQuery):
+    await call.answer()
+    loop = asyncio.get_running_loop()
+    stats = await loop.run_in_executor(None, _db_get_stats)
+    top_text = "".join(f"  • {title}: {cnt} шт.\n" for title, cnt in stats["top_products"])
+    text = (
+        "📊 <b>Статистика</b>\n\n"
+        f"👤 Покупателей: <b>{stats['unique_buyers']}</b>\n"
+        f"🛒 Покупок всего: <b>{stats['total_purchases']}</b>\n"
+        f"📅 Сегодня: <b>{stats['today']}</b>\n\n"
+        f"📦 Активных товаров: <b>{stats['products_active']}</b> / {stats['products_total']}\n\n"
+        f"🏆 Топ-5:\n{top_text or '  —'}"
+    )
+    kb = InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Назад", callback_data="adm:back"))
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query_handler(lambda c: c.data == "adm:refresh", user_id=[ADMIN_CHAT_ID])
+async def adm_refresh_cb(call: types.CallbackQuery):
+    await call.answer()
+    global _products_cache, _purchases_sheet_title
+    _products_cache = (0.0, [])
+    _purchases_sheet_title = None
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _db_cleanup_pending_orders)
+    await call.message.answer("✅ Кеш сброшен, старые заказы очищены.")
+
+
+# ---- ADD PRODUCT FSM ----
+
+@dp.callback_query_handler(lambda c: c.data == "adm:add", user_id=[ADMIN_CHAT_ID], state="*")
+async def adm_add_start(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.finish()
+    await state.set_state(AddProduct.waiting_pdf)
+    await call.message.answer(
+        "➕ <b>Добавление товара</b>\n\n"
+        "Шаг 1/7: Отправь <b>PDF-файл</b> товара 📄\n\n"
+        "Для отмены: /cancel",
+        parse_mode="HTML"
+    )
+
+
+@dp.message_handler(commands=["cancel"], user_id=[ADMIN_CHAT_ID], state="*")
+async def adm_cancel_cmd(message: types.Message, state: FSMContext):
+    await state.finish()
+    await message.answer("❌ Отменено.", reply_markup=admin_main_kb())
+
+
+@dp.callback_query_handler(lambda c: c.data == "adm:cancel", user_id=[ADMIN_CHAT_ID], state="*")
+async def adm_cancel_cb(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.finish()
+    await call.message.answer("❌ Отменено.", reply_markup=admin_main_kb())
+
+
+@dp.message_handler(
+    content_types=types.ContentType.DOCUMENT,
+    user_id=[ADMIN_CHAT_ID],
+    state=AddProduct.waiting_pdf
+)
+async def adm_got_pdf(message: types.Message, state: FSMContext):
+    if message.document.mime_type != "application/pdf":
+        await message.answer("⚠️ Нужен PDF-файл. Попробуй ещё раз.")
+        return
+    await state.update_data(file_id=message.document.file_id)
+    await state.set_state(AddProduct.waiting_preview)
+    await message.answer(
+        "✅ PDF получен!\n\n"
+        "Шаг 2/7: Отправь <b>фото-превью</b> 🖼\n"
+        "или напиши <b>нет</b> чтобы пропустить",
+        parse_mode="HTML"
+    )
+
+
+@dp.message_handler(
+    content_types=[types.ContentType.PHOTO, types.ContentType.TEXT],
+    user_id=[ADMIN_CHAT_ID],
+    state=AddProduct.waiting_preview
+)
+async def adm_got_preview(message: types.Message, state: FSMContext):
+    preview_file_id = message.photo[-1].file_id if message.photo else ""
+    await state.update_data(preview_file_id=preview_file_id)
+    await state.set_state(AddProduct.waiting_title)
+    await message.answer("Шаг 3/7: Введи <b>название</b> товара", parse_mode="HTML")
+
+
+@dp.message_handler(user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_title)
+async def adm_got_title(message: types.Message, state: FSMContext):
+    title = message.text.strip()
+    if len(title) < 2:
+        await message.answer("⚠️ Слишком короткое название.")
+        return
+    await state.update_data(title=title)
+    await state.set_state(AddProduct.waiting_desc)
+    await message.answer(
+        "Шаг 4/7: Введи <b>описание</b> товара\n(или <b>нет</b> для пропуска)",
+        parse_mode="HTML"
+    )
+
+
+@dp.message_handler(user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_desc)
+async def adm_got_desc(message: types.Message, state: FSMContext):
+    desc = "" if message.text.strip().lower() == "нет" else message.text.strip()
+    await state.update_data(description=desc)
+    await state.set_state(AddProduct.waiting_category)
+    loop = asyncio.get_running_loop()
+    products = await loop.run_in_executor(None, _db_get_all_products, False)
+    cats = sorted({p.get("category", "") for p in products if p.get("category")})
+    cats_text = "\n".join(f"• {c}" for c in cats) if cats else "—"
+    await message.answer(
+        f"Шаг 5/7: Введи <b>категорию</b>\n\nСуществующие:\n{cats_text}",
+        parse_mode="HTML"
+    )
+
+
+@dp.message_handler(user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_category)
+async def adm_got_category(message: types.Message, state: FSMContext):
+    await state.update_data(category=message.text.strip())
+    await state.set_state(AddProduct.waiting_price_xtr)
+    await message.answer(
+        "Шаг 6/7: Цена в <b>Stars</b> (целое число, 0 = бесплатно)",
+        parse_mode="HTML"
+    )
+
+
+@dp.message_handler(user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_price_xtr)
+async def adm_got_price_xtr(message: types.Message, state: FSMContext):
+    try:
+        price = int(message.text.strip())
+        if price < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("⚠️ Введи целое неотрицательное число. Пример: <code>50</code>", parse_mode="HTML")
+        return
+    await state.update_data(price_xtr=price)
+    await state.set_state(AddProduct.waiting_price_crypto)
+    await message.answer(
+        f"Шаг 7/7: Цена в <b>крипте</b> (например <code>1.5</code>)\n"
+        f"Валюта по умолчанию: {CRYPTO_PAY_DEFAULT_ASSET}\n"
+        "Или напиши <b>нет</b>",
+        parse_mode="HTML"
+    )
+
+
+@dp.message_handler(user_id=[ADMIN_CHAT_ID], state=AddProduct.waiting_price_crypto)
+async def adm_got_price_crypto(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if text.lower() == "нет":
+        await state.update_data(price_crypto="", crypto_asset="")
+    else:
+        test_prod = {"price_crypto": text, "product_id": "test"}
+        if parse_crypto_amount(test_prod) is None:
+            await message.answer(
+                "⚠️ Неверный формат. Пример: <code>1.5</code> или напиши <b>нет</b>",
+                parse_mode="HTML"
+            )
+            return
+        await state.update_data(price_crypto=text, crypto_asset=CRYPTO_PAY_DEFAULT_ASSET)
+
+    data = await state.get_data()
+    product_id = _gen_product_id()
+    await state.update_data(product_id=product_id)
+
+    price_line = f"⭐ {data['price_xtr']} Stars"
+    if data.get("price_crypto"):
+        price_line += f"  |  💰 {data['price_crypto']} {data.get('crypto_asset', '')}"
+    if not data["price_xtr"] and not data.get("price_crypto"):
+        price_line = "🎁 Бесплатно"
+
+    preview_text = (
+        f"📄 <b>{data['title']}</b>\n"
+        f"<i>📂 {data['category']}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{data.get('description', '') or 'PDF файл'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{price_line}\n\n"
+        f"🆔 <code>{product_id}</code>\n\n"
+        f"Добавить товар?"
+    )
+    await state.set_state(AddProduct.confirm)
+    if data.get("preview_file_id"):
+        await message.answer_photo(
+            data["preview_file_id"],
+            caption=preview_text,
+            reply_markup=admin_confirm_kb(),
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(preview_text, reply_markup=admin_confirm_kb(), parse_mode="HTML")
+
+
+@dp.callback_query_handler(lambda c: c.data == "adm:confirm", user_id=[ADMIN_CHAT_ID], state=AddProduct.confirm)
+async def adm_confirm_add(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    data = await state.get_data()
+    await state.finish()
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(None, _db_insert_product, data)
+    global _products_cache
+    _products_cache = (0.0, [])
+    if ok:
+        await call.message.answer(
+            f"✅ Товар <b>{data['title']}</b> добавлен!\n"
+            f"🆔 <code>{data['product_id']}</code>",
+            reply_markup=admin_main_kb(),
+            parse_mode="HTML"
+        )
+    else:
+        await call.message.answer(
+            "❌ Не удалось добавить. ID уже существует или ошибка БД.",
+            reply_markup=admin_main_kb()
+        )
+
+
+# ---- EDIT PRODUCT FSM ----
+
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:edit:"), user_id=[ADMIN_CHAT_ID], state="*")
+async def adm_edit_product(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.finish()
+    pid = call.data.split("adm:edit:", 1)[1]
+    loop = asyncio.get_running_loop()
+    prod = await loop.run_in_executor(None, _db_get_product, pid)
+    if not prod:
+        await call.answer("Товар не найден.", show_alert=True)
+        return
+    await state.update_data(editing_product_id=pid)
+    await call.message.answer(
+        f"✏️ <b>Редактирование:</b>\n\n{_format_admin_card(prod)}\n\nЧто изменить?",
+        reply_markup=admin_edit_kb(pid),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("adm:ef:"), user_id=[ADMIN_CHAT_ID], state="*")
+async def adm_edit_field(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    parts = call.data.split(":")
+    pid, field = parts[2], parts[3]
+    await state.update_data(editing_product_id=pid, editing_field=field)
+    await state.set_state(EditProduct.waiting_value)
+    prompts = {
+        "title": "Введи новое <b>название</b>:",
+        "desc": "Введи новое <b>описание</b> (или <b>нет</b> для пустого):",
+        "category": "Введи новую <b>категорию</b>:",
+        "price_xtr": "Введи новую цену в <b>Stars</b> (целое число):",
+        "price_crypto": "Введи новую цену в <b>крипте</b> или <b>нет</b>:",
+        "file_id": "Отправь новый <b>PDF-файл</b>:",
+        "preview_file_id": "Отправь новое <b>фото-превью</b> или напиши <b>нет</b>:",
+    }
+    await call.message.answer(prompts.get(field, "Введи новое значение:"), parse_mode="HTML")
+
+
+@dp.message_handler(
+    content_types=[types.ContentType.TEXT, types.ContentType.DOCUMENT, types.ContentType.PHOTO],
+    user_id=[ADMIN_CHAT_ID],
+    state=EditProduct.waiting_value
+)
+async def adm_save_field(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    pid = data.get("editing_product_id")
+    field = data.get("editing_field")
+    text = message.text.strip() if message.text else ""
+    update: Dict[str, Any] = {}
+
+    if field == "title":
+        if len(text) < 2:
+            await message.answer("⚠️ Слишком короткое.")
+            return
+        update["title"] = text
+    elif field == "desc":
+        update["description"] = "" if text.lower() == "нет" else text
+    elif field == "category":
+        update["category"] = text
+    elif field == "price_xtr":
+        try:
+            v = int(text)
+            if v < 0: raise ValueError
+            update["price_xtr"] = v
+        except ValueError:
+            await message.answer("⚠️ Введи целое неотрицательное число.")
+            return
+    elif field == "price_crypto":
+        if text.lower() == "нет":
+            update["price_crypto"] = ""
+        else:
+            test = {"price_crypto": text, "product_id": "test"}
+            if parse_crypto_amount(test) is None:
+                await message.answer("⚠️ Неверный формат. Пример: <code>1.5</code>", parse_mode="HTML")
+                return
+            update["price_crypto"] = text
+    elif field == "file_id":
+        if message.document and message.document.mime_type == "application/pdf":
+            update["file_id"] = message.document.file_id
+        else:
+            await message.answer("⚠️ Нужен PDF-файл.")
+            return
+    elif field == "preview_file_id":
+        if message.photo:
+            update["preview_file_id"] = message.photo[-1].file_id
+        elif text.lower() == "нет":
+            update["preview_file_id"] = ""
+        else:
+            await message.answer("⚠️ Отправь фото или напиши <b>нет</b>.", parse_mode="HTML")
+            return
+
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(None, _db_update_product, pid, update)
+    global _products_cache
+    _products_cache = (0.0, [])
+    await state.finish()
+
+    if ok:
+        prod = await loop.run_in_executor(None, _db_get_product, pid)
+        await message.answer(
+            f"✅ Обновлено!\n\n{_format_admin_card(prod)}",
+            reply_markup=admin_edit_kb(pid),
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer("❌ Не удалось обновить.", reply_markup=admin_main_kb())
 
 
 # =========================
