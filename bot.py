@@ -1451,22 +1451,33 @@ async def cb_category(call: types.CallbackQuery):
 # ПРЕДПРОСМОТР ТОВАРА
 # =========================
 
+def _has_multiple_pay_methods(product: Dict[str, Any]) -> bool:
+    """Проверяет, доступно ли несколько способов оплаты."""
+    has_stars = int(product.get("price_xtr", 0) or 0) > 0
+    has_crypto = can_buy_with_crypto(product)
+    return has_stars and has_crypto
+
+
 def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
     pid = product["product_id"]
-    price_xtr = int(product.get("price_xtr", 0) or 0)
-    price_crypto_raw = _to_str(product.get("price_crypto", ""))
-    crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
 
     if is_free_product(product):
         kb.add(InlineKeyboardButton("Скачать бесплатно 🎁", callback_data=f"get:{pid}"))
+    elif _has_multiple_pay_methods(product):
+        # Несколько способов — одна кнопка "Купить", откроет меню выбора
+        kb.add(InlineKeyboardButton("Купить", callback_data=f"buy:{pid}:{category_key}"))
     else:
+        # Только один способ — сразу нужная кнопка
+        price_xtr = int(product.get("price_xtr", 0) or 0)
+        price_crypto_raw = _to_str(product.get("price_crypto", ""))
+        crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
         if price_xtr > 0:
             kb.add(InlineKeyboardButton(
                 f"Купить за {price_xtr} Stars ⭐",
                 callback_data=f"paystars:{pid}"
             ))
-        if can_buy_with_crypto(product):
+        elif can_buy_with_crypto(product):
             kb.add(InlineKeyboardButton(
                 f"Купить за {price_crypto_raw} {crypto_asset}",
                 callback_data=f"paycrypto:{pid}"
@@ -1669,6 +1680,113 @@ async def cb_back_items(call: types.CallbackQuery):
 
 # =========================
 # ДЕЙСТВИЯ: бесплатно / STARS / CRYPTO
+# =========================
+# МЕНЮ ВЫБОРА СПОСОБА ОПЛАТЫ
+# =========================
+
+def payment_methods_kb(product: Dict[str, Any], category_key: str) -> InlineKeyboardMarkup:
+    """
+    Клавиатура выбора способа оплаты.
+    Чтобы добавить новый метод (например, карта РФ) — просто добавьте кнопку здесь.
+    """
+    kb = InlineKeyboardMarkup(row_width=1)
+    pid = product["product_id"]
+    price_xtr = int(product.get("price_xtr", 0) or 0)
+    price_crypto_raw = _to_str(product.get("price_crypto", ""))
+    crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
+
+    if price_xtr > 0:
+        kb.add(InlineKeyboardButton(
+            f"Telegram Stars — {price_xtr} ⭐",
+            callback_data=f"paystars:{pid}"
+        ))
+    if can_buy_with_crypto(product):
+        kb.add(InlineKeyboardButton(
+            f"Криптовалюта — {price_crypto_raw} {crypto_asset}",
+            callback_data=f"paycrypto:{pid}"
+        ))
+
+    # Сюда легко добавить новый метод, например:
+    # kb.add(InlineKeyboardButton("Карта РФ — ... ₽", callback_data=f"paycard:{pid}"))
+
+    kb.add(InlineKeyboardButton("← Назад к товару", callback_data=f"back_to_item:{pid}:{category_key}"))
+    return kb
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("buy:"))
+async def cb_buy_menu(call: types.CallbackQuery):
+    """Показывает меню выбора способа оплаты."""
+    parts = call.data.split(":", 2)
+    if len(parts) < 3:
+        await call.answer("Некорректная кнопка.", show_alert=True)
+        return
+
+    pid = parts[1]
+    category_key = parts[2]
+
+    _all_products = await load_products()
+    product = next((p for p in _all_products if p["product_id"] == pid), None)
+    if not product:
+        await call.answer("Материал не найден.", show_alert=True)
+        return
+
+    user = call.from_user
+    if await user_has_purchase(user.id, pid):
+        await call.answer()
+        await bot.send_document(call.message.chat.id, product["file_id"])
+        return
+
+    await call.answer()
+
+    price_xtr = int(product.get("price_xtr", 0) or 0)
+    crypto_amount = parse_crypto_amount(product)
+    crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
+
+    parts_price = []
+    if price_xtr > 0:
+        parts_price.append(f"{price_xtr} Stars ⭐")
+    if crypto_amount is not None:
+        parts_price.append(f"{crypto_amount} {crypto_asset}")
+    price_summary = "  /  ".join(parts_price)
+
+    try:
+        await call.message.edit_reply_markup(
+            reply_markup=payment_methods_kb(product, category_key)
+        )
+    except Exception:
+        await bot.send_message(
+            call.message.chat.id,
+            "Выберите способ оплаты:\n\n" + product["title"] + "\n\n" + price_summary,
+            reply_markup=payment_methods_kb(product, category_key),
+            parse_mode="HTML"
+        )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("back_to_item:"))
+async def cb_back_to_item(call: types.CallbackQuery):
+    """Возврат к карточке товара из меню оплаты."""
+    parts = call.data.split(":", 2)
+    if len(parts) < 3:
+        await call.answer()
+        return
+
+    pid = parts[1]
+    category_key = parts[2]
+
+    _all_products = await load_products()
+    product = next((p for p in _all_products if p["product_id"] == pid), None)
+    if not product:
+        await call.answer("Материал не найден.", show_alert=True)
+        return
+
+    await call.answer()
+    kb = product_action_kb(product, category_key=category_key)
+    try:
+        await call.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+
+
 # =========================
 
 @dp.callback_query_handler(lambda c: c.data.startswith("get:"))
@@ -3215,18 +3333,20 @@ def product_action_kb_fav(product: Dict[str, Any], category_key: str,
                            is_fav: bool) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
     pid = product["product_id"]
-    price_xtr = int(product.get("price_xtr", 0) or 0)
-    price_crypto_raw = _to_str(product.get("price_crypto", ""))
-    crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
 
     if is_free_product(product):
         kb.add(InlineKeyboardButton("Скачать бесплатно 🎁", callback_data=f"get:{pid}"))
+    elif _has_multiple_pay_methods(product):
+        kb.add(InlineKeyboardButton("Купить", callback_data=f"buy:{pid}:{category_key}"))
     else:
+        price_xtr = int(product.get("price_xtr", 0) or 0)
+        price_crypto_raw = _to_str(product.get("price_crypto", ""))
+        crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
         if price_xtr > 0:
             kb.add(InlineKeyboardButton(
                 f"Купить за {price_xtr} Stars ⭐",
                 callback_data=f"paystars:{pid}"))
-        if can_buy_with_crypto(product):
+        elif can_buy_with_crypto(product):
             kb.add(InlineKeyboardButton(
                 f"Купить за {price_crypto_raw} {crypto_asset}",
                 callback_data=f"paycrypto:{pid}"))
