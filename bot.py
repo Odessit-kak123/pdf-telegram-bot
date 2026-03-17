@@ -227,7 +227,7 @@ def _db_save_pending_order(
     """Сохраняет снимок товара перед оплатой. Возвращает True если сохранено."""
     try:
         with _get_db() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT OR IGNORE INTO pending_orders
                    (created_at, user_id, product_id, product_title, file_id,
                     payment_method, expected_amount, expected_asset, external_invoice_id)
@@ -245,7 +245,7 @@ def _db_save_pending_order(
                 )
             )
             conn.commit()
-        return True
+            return cursor.rowcount > 0
     except Exception as e:
         logger.exception("pending_orders insert error: %s", e)
         return False
@@ -283,11 +283,9 @@ def _db_delete_pending_order(payment_method: str, external_invoice_id: str, user
 def _db_cleanup_pending_orders() -> None:
     """Удаляет pending orders старше 7 дней."""
     try:
-        cutoff = (datetime.now().replace(hour=0, minute=0, second=0)
-                  .__format__("%Y-%m-%d %H:%M:%S"))
         with _get_db() as conn:
             cursor = conn.execute(
-                "DELETE FROM pending_orders WHERE created_at < date('now', '-7 days')"
+                "DELETE FROM pending_orders WHERE created_at < datetime('now', '-7 days')"
             )
             conn.commit()
             if cursor.rowcount:
@@ -1343,6 +1341,14 @@ async def cb_pay_stars(call: types.CallbackQuery):
         await call.answer()
     except Exception as e:
         logger.exception("Ошибка send_invoice (Stars): %s", e)
+        # Удаляем pending — invoice не создан, snapshot не нужен
+        try:
+            loop_exc = asyncio.get_running_loop()
+            await loop_exc.run_in_executor(
+                None, _db_delete_pending_order, "stars", stars_order_key, user.id
+            )
+        except Exception:
+            pass
         await call.answer("Не удалось создать счёт Stars. Проверь настройки бота.", show_alert=True)
 
 
@@ -1397,11 +1403,22 @@ async def cb_pay_crypto(call: types.CallbackQuery):
         )
         if not saved:
             logger.error("Не удалось сохранить pending для crypto invoice %s", invoice_id)
-            # Не прерываем — invoice уже создан, пользователь всё равно может оплатить
+            # Invoice создан, но snapshot не сохранён — сообщаем пользователю
+            # Кнопка оплаты не показывается чтобы не создавать сирот
+            await call.answer(
+                "Не удалось подготовить заказ. Попробуйте ещё раз.",
+                show_alert=True
+            )
+            return
         pay_url = invoice.get("bot_invoice_url") or invoice.get("pay_url")
 
         if not pay_url:
             logger.error("Crypto Pay не вернул pay_url для invoice: %s", invoice)
+            # Удаляем pending — без ссылки пользователь не может оплатить
+            loop_pu = asyncio.get_running_loop()
+            await loop_pu.run_in_executor(
+                None, _db_delete_pending_order, "crypto", str(invoice_id), user.id
+            )
             await call.answer("Не удалось получить ссылку на оплату. Попробуйте позже.", show_alert=True)
             return
 
@@ -1597,9 +1614,21 @@ async def successful_payment(message: types.Message):
 
     # payload = "buystars:{user_id}:{pid}:{timestamp_ms}"
     stars_order_key = payload.split("buystars:", 1)[1].strip()
-    # Извлекаем pid из ключа: user_id:pid:timestamp
     key_parts = stars_order_key.split(":")
-    pid = key_parts[1] if len(key_parts) >= 2 else stars_order_key
+    # Строгая проверка формата ключа
+    if len(key_parts) != 3:
+        logger.error("Stars payload неожиданного формата: %r", payload)
+        await message.answer("Ошибка данных оплаты. Напишите в поддержку через /help.")
+        return
+    payload_user_id, pid, _ = key_parts
+    # Проверяем что payload принадлежит текущему пользователю
+    if payload_user_id != str(message.from_user.id):
+        logger.warning(
+            "Stars payload user mismatch: payload_user=%s actual_user=%s",
+            payload_user_id, message.from_user.id
+        )
+        await message.answer("Ошибка авторизации. Напишите в поддержку через /help.")
+        return
 
     loop = asyncio.get_running_loop()
     pending = await loop.run_in_executor(
@@ -1737,4 +1766,5 @@ if __name__ == "__main__":
         )
     else:
         init_db()
+        _db_cleanup_pending_orders()  # Чистим устаревшие pending при старте
         executor.start_polling(dp, skip_updates=True)
