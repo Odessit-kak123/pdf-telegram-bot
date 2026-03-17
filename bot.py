@@ -249,11 +249,24 @@ def init_db() -> None:
                 file_id        TEXT    NOT NULL,
                 preview_file_id TEXT,
                 category       TEXT    NOT NULL DEFAULT 'Без категории',
+                age_min        INTEGER NOT NULL DEFAULT 0,
+                age_max        INTEGER NOT NULL DEFAULT 99,
+                tags           TEXT    NOT NULL DEFAULT '',
                 active         INTEGER NOT NULL DEFAULT 1,
                 created_at     TEXT    NOT NULL,
                 updated_at     TEXT    NOT NULL
             )
         """)
+        # Миграция: добавляем поля если их нет (для существующих БД)
+        for col, definition in [
+            ("age_min", "INTEGER NOT NULL DEFAULT 0"),
+            ("age_max", "INTEGER NOT NULL DEFAULT 99"),
+            ("tags",    "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE products ADD COLUMN {col} {definition}")
+            except Exception:
+                pass  # колонка уже существует
         conn.commit()
     logger.info("SQLite DB ready: %s", DB_PATH)
 
@@ -283,21 +296,51 @@ def _db_get_product(product_id: str) -> Optional[Dict]:
     return dict(row) if row else None
 
 
+def _parse_age_range(age_str: str) -> Tuple[int, int]:
+    """
+    Парсит строку возраста в (age_min, age_max).
+    Примеры: "3-6" -> (3, 6), "5" -> (5, 5), "3-6 лет" -> (3, 6), "" -> (0, 99)
+    """
+    if not age_str or not age_str.strip():
+        return 0, 99
+    nums = re.findall(r'\d+', age_str)
+    if len(nums) >= 2:
+        return int(nums[0]), int(nums[1])
+    elif len(nums) == 1:
+        return int(nums[0]), int(nums[0])
+    return 0, 99
+
+
+def _normalize_tags(tags_str: str) -> str:
+    """
+    Нормализует строку тегов: убирает лишние пробелы, переводит в нижний регистр.
+    "Творчество, Логика" -> "творчество,логика"
+    """
+    if not tags_str:
+        return ""
+    parts = [t.strip().lower() for t in tags_str.replace(";", ",").split(",") if t.strip()]
+    return ",".join(parts)
+
+
 def _db_insert_product(data: Dict[str, Any]) -> bool:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    age_min, age_max = _parse_age_range(data.get("age_range", ""))
+    tags = _normalize_tags(data.get("tags", ""))
     try:
         with _get_db() as conn:
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO products
                    (product_id, title, description, price_xtr, price_crypto, crypto_asset,
-                    file_id, preview_file_id, category, active, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                    file_id, preview_file_id, category, age_min, age_max, tags, active, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
                 (
                     data["product_id"], data["title"], data.get("description", ""),
                     int(data.get("price_xtr", 0) or 0),
                     data.get("price_crypto", ""), data.get("crypto_asset", ""),
                     data["file_id"], data.get("preview_file_id", ""),
-                    data.get("category", "Без категории"), now, now,
+                    data.get("category", "Без категории"),
+                    age_min, age_max, tags,
+                    now, now,
                 )
             )
             conn.commit()
@@ -774,6 +817,9 @@ async def load_products() -> List[Dict[str, Any]]:
                 "file_id": r["file_id"],
                 "preview_file_id": r.get("preview_file_id", ""),
                 "category": r.get("category", "Без категории"),
+                "age_min": int(r.get("age_min", 0) or 0),
+                "age_max": int(r.get("age_max", 99) or 99),
+                "tags": r.get("tags", "") or "",
             })
         _products_cache = (time.time(), products)
         return products
@@ -1431,6 +1477,9 @@ def _format_product_card(product: Dict[str, Any]) -> str:
     crypto_amount = parse_crypto_amount(product)
     crypto_asset = _to_str(product.get("crypto_asset", ""), CRYPTO_PAY_DEFAULT_ASSET).upper()
     category = _to_str(product.get("category", ""))
+    age_min = int(product.get("age_min", 0) or 0)
+    age_max = int(product.get("age_max", 99) or 99)
+    tags = _to_str(product.get("tags", ""))
 
     if is_free_product(product):
         price_line = "🎁 <b>Бесплатно</b>"
@@ -1444,12 +1493,28 @@ def _format_product_card(product: Dict[str, Any]) -> str:
 
     cat_line = f"\n<i>📂 {category}</i>" if category else ""
 
+    # Возраст — показываем только если задан
+    if age_min > 0 or age_max < 99:
+        if age_min == age_max:
+            age_line = f"\n👶 <i>Возраст: {age_min} лет</i>"
+        else:
+            age_line = f"\n👶 <i>Возраст: {age_min}–{age_max} лет</i>"
+    else:
+        age_line = ""
+
+    # Теги — показываем только если заданы
+    if tags:
+        tag_list = [f"#{t.strip()}" for t in tags.split(",") if t.strip()]
+        tags_line = "\n" + " ".join(tag_list) if tag_list else ""
+    else:
+        tags_line = ""
+
     return (
-        f"📄 <b>{title}</b>{cat_line}\n"
+        f"📄 <b>{title}</b>{cat_line}{age_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{desc}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{price_line}"
+        f"{price_line}{tags_line}"
     )
 
 
@@ -2065,6 +2130,8 @@ class AddProduct(StatesGroup):
     waiting_category = State()
     waiting_price_xtr = State()
     waiting_price_crypto = State()
+    waiting_age = State()
+    waiting_tags = State()
     confirm = State()
 
 
@@ -2092,7 +2159,8 @@ def admin_edit_kb(product_id: str) -> InlineKeyboardMarkup:
         ("Название", "title"), ("Описание", "desc"),
         ("Категория", "category"), ("Цена Stars", "price_xtr"),
         ("Цена Крипто", "price_crypto"), ("PDF файл", "file_id"),
-        ("Превью фото", "preview_file_id"),
+        ("Превью фото", "preview_file_id"), ("Возраст", "age_range"),
+        ("Теги", "tags"),
     ]
     for label, field in fields:
         kb.add(InlineKeyboardButton(label, callback_data=f"adm:ef:{product_id}:{field}"))
@@ -2141,10 +2209,22 @@ def _format_admin_card(p: dict) -> str:
         price_parts.append(f"💰 {price_crypto} {crypto_asset}")
     if not price_parts:
         price_parts.append("🎁 Бесплатно")
+
+    age_min = int(p.get("age_min", 0) or 0)
+    age_max = int(p.get("age_max", 99) or 99)
+    if age_min > 0 or age_max < 99:
+        age_display = f"{age_min}–{age_max} лет" if age_min != age_max else f"{age_min} лет"
+    else:
+        age_display = "не указан"
+
+    tags = p.get("tags", "") or "не указаны"
+
     return (
         f"<b>{p['title']}</b>\n"
         f"📂 {p.get('category', '—')}\n"
         f"💳 {' | '.join(price_parts)}\n"
+        f"👶 Возраст: {age_display}\n"
+        f"🏷 Теги: {tags}\n"
         f"🆔 <code>{p['product_id']}</code>\n"
         f"{active_str}"
     )
@@ -2467,7 +2547,7 @@ async def adm_got_price_xtr(message: types.Message, state: FSMContext):
     await state.update_data(price_xtr=price)
     await state.set_state(AddProduct.waiting_price_crypto)
     await message.answer(
-        f"Шаг 7/7: Цена в <b>крипте</b> (например <code>1.5</code>)\n"
+        f"Шаг 7/9: Цена в <b>крипте</b> (например <code>1.5</code>)\n"
         f"Валюта по умолчанию: {CRYPTO_PAY_DEFAULT_ASSET}\n"
         "Или напиши <b>нет</b>",
         reply_markup=cancel_kb(),
@@ -2490,6 +2570,55 @@ async def adm_got_price_crypto(message: types.Message, state: FSMContext):
             return
         await state.update_data(price_crypto=text, crypto_asset=CRYPTO_PAY_DEFAULT_ASSET)
 
+    await state.set_state(AddProduct.waiting_age)
+    await message.answer(
+        "Шаг 8/9: Для какого <b>возраста</b>?\n\n"
+        "Напиши диапазон, например: <code>3-6</code> или <code>4-5</code>\n"
+        "Или напиши <b>нет</b> если не важно",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML"
+    )
+
+
+@dp.message_handler(user_id=ADMIN_IDS, state=AddProduct.waiting_age)
+async def adm_got_age(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if text.lower() == "нет":
+        await state.update_data(age_range="")
+    else:
+        age_min, age_max = _parse_age_range(text)
+        if age_min == 0 and age_max == 99:
+            await message.answer(
+                "⚠️ Не распознал возраст. Напиши например <code>3-6</code> или <b>нет</b>",
+                parse_mode="HTML"
+            )
+            return
+        await state.update_data(age_range=text)
+
+    await state.set_state(AddProduct.waiting_tags)
+    await message.answer(
+        "Шаг 9/9: Теги — <b>интересы</b> (через запятую)\n\n"
+        "Это то, по чему квиз будет подбирать материал.\n\n"
+        "<b>Доступные теги:</b>\n"
+        "• <code>творчество</code> — разукрашки, задания\n"
+        "• <code>наука</code> — познавательные сказки\n"
+        "• <code>логика</code> — развивающие игры, вопросы\n\n"
+        "Пример: <code>творчество, логика</code>\n"
+        "Или напиши <b>нет</b>",
+        reply_markup=cancel_kb(),
+        parse_mode="HTML"
+    )
+
+
+@dp.message_handler(user_id=ADMIN_IDS, state=AddProduct.waiting_tags)
+async def adm_got_tags(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if text.lower() == "нет":
+        await state.update_data(tags="")
+    else:
+        normalized = _normalize_tags(text)
+        await state.update_data(tags=normalized)
+
     data = await state.get_data()
     product_id = _gen_product_id()
     await state.update_data(product_id=product_id)
@@ -2500,13 +2629,24 @@ async def adm_got_price_crypto(message: types.Message, state: FSMContext):
     if not data["price_xtr"] and not data.get("price_crypto"):
         price_line = "🎁 Бесплатно"
 
+    age_range = data.get("age_range", "")
+    age_min, age_max = _parse_age_range(age_range)
+    if age_min > 0 or age_max < 99:
+        age_display = f"{age_min}–{age_max} лет" if age_min != age_max else f"{age_min} лет"
+    else:
+        age_display = "не указан"
+
+    tags_display = data.get("tags", "") or "не указаны"
+
     preview_text = (
         f"📄 <b>{data['title']}</b>\n"
         f"<i>📂 {data['category']}</i>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{data.get('description', '') or 'PDF файл'}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{price_line}\n\n"
+        f"{price_line}\n"
+        f"👶 Возраст: {age_display}\n"
+        f"🏷 Теги: {tags_display}\n\n"
         f"🆔 <code>{product_id}</code>\n\n"
         f"Добавить товар?"
     )
@@ -2581,6 +2721,20 @@ async def adm_edit_field(call: types.CallbackQuery, state: FSMContext):
         "price_crypto": "Введи новую цену в <b>крипте</b> или <b>нет</b>:",
         "file_id": "Отправь новый <b>PDF-файл</b>:",
         "preview_file_id": "Отправь новое <b>фото-превью</b> или напиши <b>нет</b>:",
+        "age_range": (
+            "Введи возраст для которого подходит материал.\n\n"
+            "Например: <code>3-6</code> или <code>4-5</code>\n"
+            "Или <b>нет</b> если возраст не важен"
+        ),
+        "tags": (
+            "Введи теги-интересы через запятую.\n\n"
+            "<b>Доступные теги:</b>\n"
+            "• <code>творчество</code> — разукрашки, задания\n"
+            "• <code>наука</code> — познавательные сказки\n"
+            "• <code>логика</code> — развивающие игры, вопросы\n\n"
+            "Пример: <code>творчество, логика</code>\n"
+            "Или <b>нет</b> чтобы сбросить"
+        ),
     }
     if field == "category":
         await _send_category_choice(call.message.chat.id, "Выбери <b>новую категорию</b>")
@@ -2678,6 +2832,25 @@ async def adm_save_field(message: types.Message, state: FSMContext):
         else:
             await message.answer("⚠️ Отправь фото или напиши <b>нет</b>.", parse_mode="HTML")
             return
+    elif field == "age_range":
+        if text.lower() == "нет":
+            update["age_min"] = 0
+            update["age_max"] = 99
+        else:
+            age_min, age_max = _parse_age_range(text)
+            if age_min == 0 and age_max == 99:
+                await message.answer(
+                    "⚠️ Не распознал. Напиши например <code>3-6</code> или <b>нет</b>",
+                    parse_mode="HTML"
+                )
+                return
+            update["age_min"] = age_min
+            update["age_max"] = age_max
+    elif field == "tags":
+        if text.lower() == "нет":
+            update["tags"] = ""
+        else:
+            update["tags"] = _normalize_tags(text)
 
     loop = asyncio.get_running_loop()
     ok = await loop.run_in_executor(None, _db_update_product, pid, update)
@@ -2790,15 +2963,77 @@ class QuizState(StatesGroup):
     interest = State()
 
 
+# Возрастные группы → числовые диапазоны для фильтрации
 AGE_GROUPS = ["3-4 года", "4-5 лет", "5-6 лет", "6-8 лет"]
-INTERESTS = ["Творчество", "Наука", "Логика", "Всё понемногу"]
-
-INTEREST_KEYWORDS: Dict[str, list] = {
-    "Творчество": ["детск", "задан", "разукрашк"],
-    "Наука": ["науч", "сказк", "знайк"],
-    "Логика": ["развивающ", "вопрос", "логик"],
-    "Всё понемногу": [],
+AGE_RANGES: Dict[str, Tuple[int, int]] = {
+    "3-4 года": (3, 4),
+    "4-5 лет":  (4, 5),
+    "5-6 лет":  (5, 6),
+    "6-8 лет":  (6, 8),
 }
+
+# Интересы → теги которые ищем в поле tags товара
+INTERESTS = ["Творчество", "Наука", "Логика", "Всё подряд"]
+INTEREST_TAGS: Dict[str, List[str]] = {
+    "Творчество": ["творчество"],
+    "Наука":      ["наука"],
+    "Логика":     ["логика"],
+    "Всё подряд": [],   # пустой = без фильтра по тегу
+}
+
+
+def _quiz_filter_products(
+    products: List[Dict[str, Any]],
+    age_group: str,
+    interest: str,
+) -> List[Dict[str, Any]]:
+    """
+    Фильтрует товары по возрасту и интересу.
+
+    Логика:
+    1. Возраст: товар подходит если его диапазон [age_min, age_max] пересекается
+       с выбранным диапазоном пользователя.
+       Товары без возраста (age_min=0, age_max=99) — универсальные, всегда проходят.
+    2. Теги: товар подходит если хотя бы один тег из interest_tags есть в его поле tags.
+       Если interest_tags пуст (Всё подряд) — фильтр по тегам не применяется.
+    3. Если после строгой фильтрации ничего нет — ослабляем:
+       сначала убираем фильтр по тегам, потом и по возрасту.
+    """
+    q_min, q_max = AGE_RANGES.get(age_group, (0, 99))
+    interest_tags = INTEREST_TAGS.get(interest, [])
+
+    def age_matches(p: Dict) -> bool:
+        p_min = int(p.get("age_min", 0) or 0)
+        p_max = int(p.get("age_max", 99) or 99)
+        # Универсальный товар (не заполнен) — подходит всегда
+        if p_min == 0 and p_max == 99:
+            return True
+        # Пересечение диапазонов: [p_min, p_max] ∩ [q_min, q_max] ≠ ∅
+        return p_min <= q_max and p_max >= q_min
+
+    def tag_matches(p: Dict) -> bool:
+        if not interest_tags:
+            return True  # "Всё подряд" — без фильтра
+        p_tags = [t.strip() for t in (p.get("tags", "") or "").split(",") if t.strip()]
+        return any(it in p_tags for it in interest_tags)
+
+    # Попытка 1: строгая фильтрация — и возраст, и теги
+    strict = [p for p in products if age_matches(p) and tag_matches(p)]
+    if strict:
+        return strict
+
+    # Попытка 2: только возраст (без фильтра тегов)
+    age_only = [p for p in products if age_matches(p)]
+    if age_only:
+        return age_only
+
+    # Попытка 3: только теги (без фильтра возраста) — редкий случай
+    tags_only = [p for p in products if tag_matches(p)]
+    if tags_only:
+        return tags_only
+
+    # Fallback: возвращаем всё
+    return products
 
 
 @dp.callback_query_handler(lambda c: c.data == "quiz:start", state="*")
@@ -2853,46 +3088,67 @@ async def quiz_got_interest(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     age = data.get("age", "")
     await state.finish()
+
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _db_save_quiz, call.from_user.id, age, interest)
 
     all_products = await load_products()
-    keywords = INTEREST_KEYWORDS.get(interest, [])
-    if keywords:
-        matched = [
-            p for p in all_products
-            if any(kw in p.get("category", "").lower() or kw in p.get("title", "").lower()
-                   for kw in keywords)
-        ]
-    else:
-        matched = all_products
 
+    # Фильтруем по возрасту и интересу
+    matched = _quiz_filter_products(all_products, age, interest)
+
+    # Убираем уже купленные
     result = []
-    for p in matched[:8]:
+    for p in matched:
         if not await user_has_purchase(call.from_user.id, p["product_id"]):
             result.append(p)
             if len(result) >= 4:
                 break
 
+    # Если всё куплено — показываем без фильтра по покупкам (редкий случай)
     if not result:
-        result = all_products[:4]
+        result = matched[:4]
+
+    # Определяем точность подборки для текста заголовка
+    q_min, q_max = AGE_RANGES.get(age, (0, 99))
+    interest_tags = INTEREST_TAGS.get(interest, [])
+    has_age_filtered = any(
+        not (int(p.get("age_min", 0) or 0) == 0 and int(p.get("age_max", 99) or 99) == 99)
+        for p in result
+    )
+    has_tag_filtered = interest_tags and any(
+        any(t in (p.get("tags", "") or "") for t in interest_tags)
+        for p in result
+    )
+
+    if has_age_filtered or has_tag_filtered:
+        header = f"🎯 <b>Подборка для {age}</b> — {interest}\n\n✅ Нашли {len(result)} подходящих материала:"
+    else:
+        header = f"🎯 <b>Подборка для {age}</b> — {interest}\n\n⚠️ Точных совпадений нет — показываем похожие ({len(result)} шт.):"
 
     await call.answer()
-    await call.message.edit_text(
-        f"🎯 <b>Подборка для ребёнка {age}</b> — тема: {interest}\n\nНашли {len(result)} материала:",
-        parse_mode="HTML"
-    )
+    await call.message.edit_text(header, parse_mode="HTML")
+
     for p in result:
         cat_key = _cat_key(_to_str(p.get("category", "")))
         _cat_key_to_name[cat_key] = _to_str(p.get("category", ""))
         price_xtr = int(p.get("price_xtr", 0) or 0)
         price_str = "🎁 Бесплатно" if is_free_product(p) else f"⭐ {price_xtr} Stars"
+
+        # Показываем возраст товара если задан
+        p_min = int(p.get("age_min", 0) or 0)
+        p_max = int(p.get("age_max", 99) or 99)
+        age_hint = ""
+        if p_min > 0 or p_max < 99:
+            age_hint = f"\n👶 {p_min}–{p_max} лет" if p_min != p_max else f"\n👶 {p_min} лет"
+
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("👁 Посмотреть", callback_data=f"item:{p['product_id']}:{cat_key}"))
         await call.message.answer(
-            f"📄 <b>{p['title']}</b>\n{price_str}",
+            f"📄 <b>{p['title']}</b>{age_hint}\n{price_str}",
             reply_markup=kb, parse_mode="HTML"
         )
+
     back_kb = InlineKeyboardMarkup()
     back_kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
     await call.message.answer("Нажми на товар чтобы узнать подробнее", reply_markup=back_kb)
