@@ -1514,7 +1514,7 @@ def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeybo
                 callback_data=f"paycard:{pid}:{category_key}"
             ))
 
-    kb.add(InlineKeyboardButton("В избранное 🤍", callback_data=f"fav:toggle:{pid}:{category_key}"))
+    kb.add(InlineKeyboardButton("Добавить в избранное ❤️", callback_data=f"fav:toggle:{pid}:{category_key}"))
     kb.add(InlineKeyboardButton("← Назад к списку", callback_data=f"back_items:{category_key}"))
     kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
     return kb
@@ -3591,7 +3591,7 @@ def product_action_kb_fav(product: Dict[str, Any], category_key: str,
                 f"Купить за {rub_label_fav} ₽ 💳",
                 callback_data=f"paycard:{pid}:{category_key}"))
 
-    fav_text = "Убрать из избранного ❤️" if is_fav else "В избранное 🤍"
+    fav_text = "Убрать из избранного 💔" if is_fav else "Добавить в избранное ❤️"
     kb.add(InlineKeyboardButton(fav_text, callback_data=f"fav:toggle:{pid}:{category_key}"))
     kb.add(InlineKeyboardButton("← Назад к списку", callback_data=f"back_items:{category_key}"))
     kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
