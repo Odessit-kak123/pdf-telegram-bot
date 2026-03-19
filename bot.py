@@ -4106,10 +4106,10 @@ async def send_review_requests():
                 continue
             prod = await loop.run_in_executor(None, _db_get_product, product_id)
             title = prod["title"] if prod else product_id
-            kb = InlineKeyboardMarkup(row_width=5)
-            labels = ["1 ★", "2 ★★", "3 ★★★", "4 ★★★★", "5 ★★★★★"]
+            kb = InlineKeyboardMarkup(row_width=1)
+            labels = ["⭐ 1 — плохо", "⭐⭐ 2 — так себе", "⭐⭐⭐ 3 — нормально", "⭐⭐⭐⭐ 4 — хорошо", "⭐⭐⭐⭐⭐ 5 — отлично"]
             for i in range(1, 6):
-                kb.insert(InlineKeyboardButton(
+                kb.add(InlineKeyboardButton(
                     labels[i - 1],
                     callback_data=f"rev:rate:{product_id}:{req['id']}:{i}"
                 ))
