@@ -2345,6 +2345,66 @@ async def cmd_testreview(message: types.Message):
 
 
 
+@dp.message_handler(commands=["reviews"], user_id=ADMIN_IDS)
+async def cmd_reviews(message: types.Message):
+    """
+    Просмотр всех отзывов с кнопками удаления.
+    /reviews          — все отзывы (последние 20)
+    /reviews p001     — отзывы по конкретному товару
+    /reviews @username — отзывы конкретного пользователя
+    """
+    args = message.get_args().strip()
+    loop = asyncio.get_running_loop()
+
+    if args.startswith("p"):
+        # Фильтр по product_id
+        reviews = await loop.run_in_executor(None, _db_get_reviews, args)
+        header = f"Отзывы по товару <code>{args}</code>"
+    else:
+        # Все последние отзывы
+        def _get_all_reviews():
+            with _get_db() as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM reviews ORDER BY created_at DESC LIMIT 20"
+                ).fetchall()
+            return [dict(r) for r in rows]
+        reviews = await loop.run_in_executor(None, _get_all_reviews)
+        header = "Последние отзывы (до 20)"
+
+    if not reviews:
+        await message.answer("Отзывов пока нет.")
+        return
+
+    await message.answer(f"<b>{header}</b>  —  {len(reviews)} шт.", parse_mode="HTML")
+
+    for r in reviews:
+        stars = "⭐" * r["rating"]
+        name = r.get("full_name") or "Покупатель"
+        username = r.get("username") or ""
+        comment = r.get("comment") or ""
+        title = r.get("product_title") or r.get("product_id")
+        date = r.get("created_at", "")[:10]
+
+
+        rating_val = r["rating"]
+        text = (
+            f"{stars} <b>{rating_val}/5</b>\n"
+            f"📄 {title}\n"
+            f"👤 {name} {username}\n"
+            f"📅 {date}"
+        )
+        if comment:
+            text += f"\n💬 {comment}"
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton(
+            "🗑 Удалить этот отзыв",
+            callback_data=f"rev:del:{r['id']}"
+        ))
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
 @dp.message_handler(commands=["refresh"], user_id=ADMIN_IDS)
 async def cmd_refresh(message: types.Message):
     _products_cache = (0.0, [])
@@ -4367,6 +4427,7 @@ async def _setup_bot_commands():
         BotCommand("help", "❓ Поддержка"),
         BotCommand("cancel", "❌ Отменить действие"),
         BotCommand("testreview", "🧪 Тест запроса отзыва"),
+        BotCommand("reviews", "💬 Просмотр и удаление отзывов"),
         BotCommand("cardtest", "🔍 Диагностика карты"),
     ]
     for admin_id in ADMIN_IDS:
