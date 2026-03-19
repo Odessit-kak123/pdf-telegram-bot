@@ -2293,9 +2293,60 @@ async def cmd_cardtest(message: types.Message):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+@dp.message_handler(commands=["testreview"], user_id=ADMIN_IDS)
+async def cmd_testreview(message: types.Message):
+    """
+    Тестирование запроса отзыва.
+    Использование:
+      /testreview          — отправить себе запрос по последней покупке
+      /testreview p001     — отправить запрос по конкретному product_id
+    """
+    args = message.get_args().strip()
+    user_id = message.from_user.id
+
+    loop = asyncio.get_running_loop()
+
+    if args:
+        product_id = args
+        prod = await loop.run_in_executor(None, _db_get_product, product_id)
+        if not prod:
+            await message.answer(f"Товар <code>{product_id}</code> не найден.", parse_mode="HTML")
+            return
+        title = prod["title"]
+    else:
+        # Берём последнюю покупку
+        purchases = await loop.run_in_executor(None, _db_get_user_purchases, user_id)
+        if not purchases:
+            await message.answer("У вас нет покупок для теста. Укажите product_id: /testreview p001")
+            return
+        product_id = purchases[0]["product_id"]
+        title = purchases[0].get("product_title") or product_id
+
+    # Отправляем запрос отзыва напрямую (без ожидания 24ч)
+    kb = InlineKeyboardMarkup(row_width=1)
+    labels = ["⭐ 1 — плохо", "⭐⭐ 2 — так себе", "⭐⭐⭐ 3 — нормально",
+              "⭐⭐⭐⭐ 4 — хорошо", "⭐⭐⭐⭐⭐ 5 — отлично"]
+    # Используем фиктивный req_id=0 для теста
+    for i in range(1, 6):
+        kb.add(InlineKeyboardButton(
+            labels[i - 1],
+            callback_data=f"rev:rate:{product_id}:0:{i}"
+        ))
+    kb.add(InlineKeyboardButton("Пропустить", callback_data="rev:skip:0"))
+
+
+    await message.answer(
+        "<b>Тест запроса отзыва</b>\n\n"
+        f"Товар: <b>{title}</b>\n\n"
+        f"Как вам материал <b>{title}</b>?\n\nПоставьте оценку от 1 до 5:",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+
+
 @dp.message_handler(commands=["refresh"], user_id=ADMIN_IDS)
 async def cmd_refresh(message: types.Message):
-    global _products_cache, _purchases_sheet_title
     _products_cache = (0.0, [])
     _purchases_sheet_title = None
     loop = asyncio.get_running_loop()
@@ -4315,6 +4366,8 @@ async def _setup_bot_commands():
         BotCommand("refresh", "🔄 Сбросить кеш"),
         BotCommand("help", "❓ Поддержка"),
         BotCommand("cancel", "❌ Отменить действие"),
+        BotCommand("testreview", "🧪 Тест запроса отзыва"),
+        BotCommand("cardtest", "🔍 Диагностика карты"),
     ]
     for admin_id in ADMIN_IDS:
         try:
