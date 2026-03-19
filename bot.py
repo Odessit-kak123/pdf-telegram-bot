@@ -1329,29 +1329,21 @@ async def send_favourites(chat_id: int, user: types.User, edit_message: Optional
         if not product:
             continue
         is_bought = await user_has_purchase(user.id, pid)
-        price_xtr = int(product.get("price_xtr", 0) or 0)
-        if is_bought:
-            status = "✅"
-        elif is_free_product(product):
-            status = "🎁"
-        else:
-            status = f"⭐{price_xtr}"
-
         price_xtr_fav = int(product.get("price_xtr", 0) or 0)
         price_hint_fav = "бесплатно" if is_free_product(product) else f"{price_xtr_fav} ⭐"
-        bought_hint = " ✓" if is_bought else ""
+        bought_hint = " — куплено ✓" if is_bought else ""
         lines.append(f"• {product['title']}  <i>({price_hint_fav}{bought_hint})</i>")
         cat_key = _cat_key(_to_str(product.get("category", "")))
         _cat_key_to_name[cat_key] = _to_str(product.get("category", ""))
 
         if is_bought:
             kb.add(InlineKeyboardButton(
-                f"📥 Скачать: {product['title'][:30]}",
+                f"📥 {product['title'][:35]}",
                 callback_data=f"dl:{pid}"
             ))
         else:
             kb.add(InlineKeyboardButton(
-                _product_btn_label(product),
+                product['title'],
                 callback_data=f"item:{pid}:{cat_key}"
             ))
 
@@ -1522,7 +1514,7 @@ def product_action_kb(product: Dict[str, Any], category_key: str) -> InlineKeybo
                 callback_data=f"paycard:{pid}:{category_key}"
             ))
 
-    kb.add(InlineKeyboardButton("В избранное ❤️", callback_data=f"fav:toggle:{pid}:{category_key}"))
+    kb.add(InlineKeyboardButton("В избранное 🤍", callback_data=f"fav:toggle:{pid}:{category_key}"))
     kb.add(InlineKeyboardButton("← Назад к списку", callback_data=f"back_items:{category_key}"))
     kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
     return kb
@@ -3488,7 +3480,7 @@ def product_action_kb_fav(product: Dict[str, Any], category_key: str,
                 f"Купить за {rub_label_fav} ₽ 💳",
                 callback_data=f"paycard:{pid}:{category_key}"))
 
-    fav_text = "В избранном ❤️" if is_fav else "В избранное 🤍"
+    fav_text = "Убрать из избранного ❤️" if is_fav else "В избранное 🤍"
     kb.add(InlineKeyboardButton(fav_text, callback_data=f"fav:toggle:{pid}:{category_key}"))
     kb.add(InlineKeyboardButton("← Назад к списку", callback_data=f"back_items:{category_key}"))
     kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
@@ -3683,20 +3675,22 @@ async def quiz_got_interest(call: types.CallbackQuery, state: FSMContext):
         if p_min > 0 or p_max < 99:
             age_hint = f"\n👶 {p_min}–{p_max} лет" if p_min != p_max else f"\n👶 {p_min} лет"
 
+        age_text = f"  <i>({p_min}–{p_max} лет)</i>" if (p_min > 0 or p_max < 99) else ""
+        price_xtr_q = int(p.get("price_xtr", 0) or 0)
+        price_text = "бесплатно" if is_free_product(p) else f"{price_xtr_q} ⭐"
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton(
-            _product_btn_label(p),
+            "Посмотреть →",
             callback_data=f"item:{p['product_id']}:{cat_key}"
         ))
-        age_text = f"  <i>({p_min}–{p_max} лет)</i>" if (p_min > 0 or p_max < 99) else ""
         await call.message.answer(
-            f"<b>{p['title']}</b>{age_text}",
+            f"<b>{p['title']}</b>{age_text}  <i>({price_text})</i>",
             reply_markup=kb, parse_mode="HTML"
         )
 
     back_kb = InlineKeyboardMarkup()
     back_kb.add(InlineKeyboardButton("🏠 Главная", callback_data="open:start"))
-    await call.message.answer("Нажмите на материал чтобы узнать подробнее", reply_markup=back_kb)
+    await call.message.answer("─────────────", reply_markup=back_kb)
 
 # =========================
 # ОПЛАТА КАРТОЙ РФ (ручная проверка)
@@ -3913,14 +3907,22 @@ async def cb_card_approve(call: types.CallbackQuery):
             await call.answer("Товар не найден. Проверьте вручную.", show_alert=True)
             return
 
-    # Создаём фейковый user-объект для grant (нужны только id и имя)
+    # Получаем реальные данные пользователя через Telegram API
     class _FakeUser:
-        def __init__(self, uid):
+        def __init__(self, uid, username=None, full_name=None):
             self.id = uid
-            self.username = None
-            self.full_name = f"user_{uid}"
+            self.username = username
+            self.full_name = full_name or f"user_{uid}"
 
-    fake_user = _FakeUser(target_user_id)
+    try:
+        chat_info = await bot.get_chat(target_user_id)
+        real_username = chat_info.username or None
+        real_full_name = chat_info.full_name or f"user_{target_user_id}"
+    except Exception:
+        real_username = None
+        real_full_name = f"user_{target_user_id}"
+
+    fake_user = _FakeUser(target_user_id, username=real_username, full_name=real_full_name)
 
     ok = await grant_product_to_user(
         chat_id=target_user_id,
@@ -4105,15 +4107,16 @@ async def send_review_requests():
             prod = await loop.run_in_executor(None, _db_get_product, product_id)
             title = prod["title"] if prod else product_id
             kb = InlineKeyboardMarkup(row_width=5)
+            labels = ["1 ★", "2 ★★", "3 ★★★", "4 ★★★★", "5 ★★★★★"]
             for i in range(1, 6):
                 kb.insert(InlineKeyboardButton(
-                    "⭐" * i,
+                    labels[i - 1],
                     callback_data=f"rev:rate:{product_id}:{req['id']}:{i}"
                 ))
             kb.add(InlineKeyboardButton("Пропустить", callback_data=f"rev:skip:{req['id']}"))
             await bot.send_message(
                 user_id,
-                f"Как вам материал <b>{title}</b>? Поставьте оценку:",
+                f"Как вам материал <b>{title}</b>?\n\nПоставьте оценку от 1 до 5:",
                 reply_markup=kb, parse_mode="HTML"
             )
             await loop.run_in_executor(None, _db_mark_review_request_sent, req["id"])
@@ -4144,9 +4147,10 @@ async def cb_review_rate(call: types.CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("Пропустить", callback_data=f"rev:nc:{product_id}:{rating}"))
     await call.answer()
+    stars_label = ["", "1 ★", "2 ★★", "3 ★★★", "4 ★★★★", "5 ★★★★★"]
     await call.message.edit_text(
-        f"Оценка: {'⭐' * rating}\n\nНапишите комментарий (или нажмите пропустить):",
-        reply_markup=kb
+        f"Оценка: <b>{stars_label[rating]}</b>\n\nНапишите комментарий (или нажмите пропустить):",
+        reply_markup=kb, parse_mode="HTML"
     )
 
 
